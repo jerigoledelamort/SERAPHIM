@@ -1,0 +1,13 @@
+# SERAPHIM — Test config for S02 prototype
+# Этот файл читает backend для проверки: config read from test root.
+# Не является production-конфигом.
+
+seraphim:
+  version: "0.2.0"
+  environment: "prototype_s02"
+  root: "D:/Projects/seraphim"
+
+health:
+  service: "seraphim-core"
+  status: "ready"
+  uptime_required: true

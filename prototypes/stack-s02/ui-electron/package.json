@@ -1,0 +1,13 @@
+{
+  "name": "seraphim-s02-electron",
+  "version": "0.0.0",
+  "private": true,
+  "description": "SERAPHIM S02 stack prototype - Electron shell. NOT production code.",
+  "main": "main.cjs",
+  "devDependencies": {
+    "electron": "33.2.0"
+  },
+  "scripts": {
+    "start": "electron . --no-sandbox"
+  }
+}

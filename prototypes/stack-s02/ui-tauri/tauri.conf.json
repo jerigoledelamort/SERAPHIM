@@ -1,0 +1,23 @@
+{
+  "productName": "seraphim-s02",
+  "version": "0.0.0",
+  "identifier": "org.seraphim.s02",
+  "build": {
+    "frontendDist": "../../shared/testroot",
+    "devUrl": "http://localhost:1420"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "SERAPHIM S02 Prototype — Tauri",
+        "width": 900,
+        "height": 700,
+        "resizable": true
+      }
+    ]
+  },
+  "bundle": {
+    "active": false,
+    "targets": "all"
+  }
+}

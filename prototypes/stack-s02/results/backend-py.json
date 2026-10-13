@@ -1,0 +1,128 @@
+{
+  "pass": 23,
+  "fail": 0,
+  "skip": 1,
+  "total": 24,
+  "items": [
+    {
+      "name": "health endpoint returns 200",
+      "status": "PASS",
+      "detail": "status=200"
+    },
+    {
+      "name": "health has service name",
+      "status": "PASS",
+      "detail": "service=seraphim-core"
+    },
+    {
+      "name": "health has config version",
+      "status": "PASS",
+      "detail": "config={\"version\": \"0.2.0\", \"environment\": \"prototype_s02\", \"digest\": \"7f5b4b49af780563"
+    },
+    {
+      "name": "health has binding info",
+      "status": "PASS",
+      "detail": "binding=127.0.0.1:64860"
+    },
+    {
+      "name": "health has config digest",
+      "status": "PASS",
+      "detail": "digest=7f5b4b49af780563"
+    },
+    {
+      "name": "no token returns 401",
+      "status": "PASS",
+      "detail": "status=401"
+    },
+    {
+      "name": "401 has structured error code",
+      "status": "PASS",
+      "detail": "code=AUTH_REQUIRED"
+    },
+    {
+      "name": "config/read returns 200",
+      "status": "PASS",
+      "detail": "status=200"
+    },
+    {
+      "name": "config file exists",
+      "status": "PASS",
+      "detail": "exists=True"
+    },
+    {
+      "name": "config has content",
+      "status": "PASS",
+      "detail": "has_content=True"
+    },
+    {
+      "name": "config content is YAML",
+      "status": "PASS",
+      "detail": "first_chars=# SERAPHIM — Test co"
+    },
+    {
+      "name": "traversal ../ blocked",
+      "status": "PASS",
+      "detail": "status=403"
+    },
+    {
+      "name": "traversal reason documented",
+      "status": "PASS",
+      "detail": "reason=path_traversal_outside_root"
+    },
+    {
+      "name": "traversal has file_root_blocked code",
+      "status": "PASS",
+      "detail": "code=FILE_ROOT_BLOCKED"
+    },
+    {
+      "name": "absolute path outside root blocked",
+      "status": "PASS",
+      "detail": "status=403"
+    },
+    {
+      "name": "symlink confinement (needs Create Symbolic Link privilege)",
+      "status": "SKIP",
+      "detail": "[WinError 1314] Клиент не обладает требуемыми правами: 'D:\\\\Projects\\\\seraphim\\\\prototypes\\\\stack-s02\\\\shared' -> 'prototypes\\\\stack-s02\\\\shared\\\\testroot\\\\link_to_root'"
+    },
+    {
+      "name": "proc/spawn returns 200",
+      "status": "PASS",
+      "detail": "status=200"
+    },
+    {
+      "name": "proc/spawn has pid",
+      "status": "PASS",
+      "detail": "pid=15928"
+    },
+    {
+      "name": "proc/spawn has job_id",
+      "status": "PASS",
+      "detail": "job=SERAPHIM-S02-Job-5e62cfe2"
+    },
+    {
+      "name": "LAN IP not accessible (bound 127.0.0.1 only)",
+      "status": "PASS",
+      "detail": "lan=10.6.7.1:64860"
+    },
+    {
+      "name": "RTT < 50ms",
+      "status": "PASS",
+      "detail": "rtt=15.0ms"
+    },
+    {
+      "name": "404 has error envelope",
+      "status": "PASS",
+      "detail": "code=404"
+    },
+    {
+      "name": "401 has error envelope",
+      "status": "PASS",
+      "detail": "code=401"
+    },
+    {
+      "name": "403 has error envelope",
+      "status": "PASS",
+      "detail": "code=403"
+    }
+  ]
+}

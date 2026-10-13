@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'">
+  <title>SERAPHIM S02 Prototype</title>
+  <style>
+    :root {
+      --bg: #08090C;
+      --surface: #111319;
+      --text: #E7E8EC;
+      --accent: #9E1B32;
+      --success: #4E9A72;
+      --warning: #C79845;
+      --border: #292D38;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: 'Courier New', monospace;
+      font-size: 14px;
+      line-height: 1.6;
+      padding: 24px;
+      transition: background 0.3s ease;
+    }
+
+    /* Reduced motion: spec requirement */
+    [data-motion="off"],
+    @media (prefers-reduced-motion: reduce) {
+      body, * {
+        transition-duration: 0s !important;
+        animation-duration: 0s !important;
+        animation-iteration-count: 1 !important;
+      }
+    }
+
+    /* Cinematic animation: scanlines + pulse */
+    body::before {
+      content: '';
+      position: fixed;
+      top: 0; left: 0; right: 0; bottom: 0;
+      background: repeating-linear-gradient(
+        0deg,
+        transparent,
+        transparent 2px,
+        rgba(0,0,0,0.08) 2px,
+        rgba(0,0,0,0.08) 4px
+      );
+      pointer-events: none;
+      z-index: 9999;
+      transition: opacity 0.3s ease;
+    }
+    [data-motion="off"] body::before,
+    @media (prefers-reduced-motion: reduce) {
+      body::before { opacity: 0 !important; }
+    }
+
+    .header {
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 12px;
+      margin-bottom: 20px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .header h1 {
+      font-size: 16px;
+      color: var(--accent);
+      letter-spacing: 2px;
+    }
+    .pulse {
+      display: inline-block;
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: var(--success);
+      margin-right: 8px;
+      animation: pulse 2s infinite;
+    }
+    [data-motion="off"] .pulse,
+    @media (prefers-reduced-motion: reduce) {
+      .pulse { animation: none; }
+    }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.3; }
+    }
+
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      padding: 16px;
+      margin-bottom: 12px;
+    }
+    .card h2 {
+      font-size: 12px;
+      color: var(--text-secondary, #9A9DA8);
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      margin-bottom: 8px;
+    }
+    .metric {
+      display: flex;
+      justify-content: space-between;
+      padding: 4px 0;
+      border-bottom: 1px solid rgba(41,45,56,0.3);
+    }
+    .metric-label { color: #9A9DA8; }
+    .metric-value { color: var(--text); font-weight: bold; }
+    .metric-value.ok { color: var(--success); }
+    .metric-value.err { color: var(--accent); }
+
+    .btn {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 8px 16px;
+      cursor: pointer;
+      font-family: inherit;
+      font-size: 12px;
+      letter-spacing: 1px;
+      transition: background 0.2s ease, border-color 0.2s ease;
+    }
+    .btn:hover {
+      border-color: var(--accent);
+      background: rgba(158,27,50,0.1);
+    }
+    .btn-group { margin: 12px 0; display: flex; gap: 8px; }
+
+    .log {
+      background: #000;
+      padding: 12px;
+      font-size: 11px;
+      max-height: 200px;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      word-break: break-all;
+    }
+  </style>
+</head>
+<body data-motion="off">
+  <div class="header">
+    <h1>◆ SERAPHIM S02 PROTOTYPE</h1>
+    <div><span class="pulse"></span><span id="statusText">INITIALIZING</span></div>
+  </div>
+
+  <div class="card">
+    <h2>Backend Health</h2>
+    <div class="metric">
+      <span class="metric-label">Service</span>
+      <span class="metric-value" id="svc">—</span>
+    </div>
+    <div class="metric">
+      <span class="metric-label">Config version</span>
+      <span class="metric-value" id="ver">—</span>
+    </div>
+    <div class="metric">
+      <span class="metric-label">Environment</span>
+      <span class="metric-value" id="env">—</span>
+    </div>
+    <div class="metric">
+      <span class="metric-label">Config digest</span>
+      <span class="metric-value" id="digest">—</span>
+    </div>
+    <div class="metric">
+      <span class="metric-label">Config read from</span>
+      <span class="metric-value" id="cfgPath">—</span>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Performance</h2>
+    <div class="metric">
+      <span class="metric-label">UI → Backend RTT</span>
+      <span class="metric-value" id="rtt">—</span>
+    </div>
+    <div class="metric">
+      <span class="metric-label">Backend port</span>
+      <span class="metric-value" id="port">—</span>
+    </div>
+    <div class="metric">
+      <span class="metric-label">Binding</span>
+      <span class="metric-value" id="binding">—</span>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Controls</h2>
+    <div class="btn-group">
+      <button class="btn" onclick="healthCheck()">HEALTH CHECK</button>
+      <button class="btn" onclick="toggleMotion()">TOGGLE MOTION</button>
+      <button class="btn" onclick="testTraversal()">TEST PATH TRAVERSAL</button>
+      <button class="btn" onclick="testSubproc()">TEST SUBPROCESS</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Event Log</h2>
+    <div class="log" id="log"></div>
+  </div>
+
+  <script>
+    const API_BASE = window.location.hostname === 'localhost' ? 'http://localhost' : '';
+    let API_PORT = 1421; // default; may be overridden
+    let motionLevel = 'off'; // off | reduced | cinematic
+
+    function log(msg) {
+      const el = document.getElementById('log');
+      const ts = new Date().toISOString();
+      el.textContent += `[${ts}] ${msg}\n`;
+      el.parentElement.scrollTop = el.parentElement.scrollHeight;
+    }
+
+    async function healthCheck() {
+      try {
+        const t0 = performance.now();
+        const res = await fetch(`${API_BASE}:${API_PORT}/health`, {
+          headers: { 'X-Seraphim-Token': 's02-test' }
+        });
+        const rtt = Math.round(performance.now() - t0);
+        const data = await res.json();
+        document.getElementById('rtt').textContent = rtt + ' ms';
+        document.getElementById('rtt').className = 'metric-value ' + (rtt < 10 ? 'ok' : 'err');
+        document.getElementById('svc').textContent = data.service || '—';
+        document.getElementById('ver').textContent = data.config.version || '—';
+        document.getElementById('env').textContent = data.config.environment || '—';
+        document.getElementById('digest').textContent = data.config.digest || '—';
+        document.getElementById('cfgPath').textContent = data.config.path || '—';
+        document.getElementById('port').textContent = String(API_PORT);
+        document.getElementById('binding').textContent = data.binding || '—';
+        document.getElementById('statusText').textContent = res.ok ? 'HEALTHY' : 'ERROR';
+        document.getElementById('statusText').style.color = res.ok ? '#4E9A72' : '#9E1B32';
+        log(`HEALTH CHECK OK (${rtt}ms): ${JSON.stringify(data.config).slice(0,120)}`);
+      } catch(e) {
+        document.getElementById('statusText').textContent = 'OFFLINE';
+        document.getElementById('statusText').style.color = '#9E1B32';
+        log(`HEALTH CHECK FAILED: ${e.message}`);
+      }
+    }
+
+    function toggleMotion() {
+      const levels = ['off', 'reduced', 'cinematic'];
+      const i = (levels.indexOf(motionLevel) + 1) % levels.length;
+      motionLevel = levels[i];
+      document.body.setAttribute('data-motion', motionLevel);
+      log(`MOTION: ${motionLevel}`);
+    }
+
+    async function testTraversal() {
+      try {
+        const res = await fetch(
+          `${API_BASE}:${API_PORT}/config/check?path=../health.yaml`,
+          { headers: { 'X-Seraphim-Token': 's02-test' } }
+        );
+        const data = await res.json();
+        log(`TRAVERSAL TEST: status=${res.status} blocked=${data.blocked ? 'YES' : 'NO'}`);
+      } catch(e) { log(`TRAVERSAL TEST ERROR: ${e.message}`); }
+    }
+
+    async function testSubproc() {
+      try {
+        const t0 = performance.now();
+        const res = await fetch(`${API_BASE}:${API_PORT}/proc/spawn`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'X-Seraphim-Token': 's02-test' },
+          body: JSON.stringify({ cmd: 'echo', args: ['hello'], timeout_ms: 5000 })
+        });
+        const data = await res.json();
+        const elapsed = Math.round(performance.now() - t0);
+        log(`SUBPROCESS TEST: pid=${data.pid} status=${data.status} elapsed=${elapsed}ms output=${JSON.stringify(data.output).slice(0,80)}`);
+      } catch(e) { log(`SUBPROCESS TEST ERROR: ${e.message}`); }
+    }
+
+    // Init
+    log('Prototype initialized. Waiting for backend...');
+    setTimeout(healthCheck, 500);
+  </script>
+</body>
+</html>

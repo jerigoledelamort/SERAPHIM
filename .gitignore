@@ -33,6 +33,13 @@ artifacts/
 Thumbs.db
 
 # Internal project documentation
-SERAPHIM_Full_Architecture_Spec.md
-SERAPHIM_Implementation_Prompt_Chain.md
-AUDIT_REPORT.md
+
+# S02 Prototype (isolated, not production)
+prototypes/**/.s02-port
+prototypes/**/logs/
+prototypes/**/gen/
+prototypes/**/icons/icon.ico
+prototypes/**/Cargo.lock
+prototypes/**/__pycache__/
+prototypes/**/*.pdb
+prototypes/**/*.exe

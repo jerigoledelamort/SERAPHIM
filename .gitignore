@@ -1,0 +1,38 @@
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Node.js
+node_modules/
+
+# Build outputs
+target/
+dist/
+build/
+coverage/
+
+# Local secrets
+.env
+.env.*
+!.env.example
+
+# Local runtime data
+data/*.sqlite
+data/*.sqlite-*
+logs/
+artifacts/
+
+# Temporary files
+*.log
+.DS_Store
+Thumbs.db
+
+# Internal project documentation
+SERAPHIM_Full_Architecture_Spec.md
+SERAPHIM_Implementation_Prompt_Chain.md
+AUDIT_REPORT.md

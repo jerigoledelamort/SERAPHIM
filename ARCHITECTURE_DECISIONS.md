@@ -24,7 +24,7 @@
 | ADR-001 | Язык backend | ACCEPTED | S03 и всё после | S02 (Python) |
 | ADR-002 | Desktop framework (VESSEL) | ACCEPTED | S03, S48+ | S02 (Electron) |
 | ADR-003 | Внутренний и внешний API (GUI↔CORE) | ACCEPTED | S03, S50 | S02 (HTTP/loopback) |
-| ADR-004 | Сериализация схем и версия manifests | PROPOSED | S04 | S04 |
+| ADR-004 | Сериализация схем и версия manifests | ACCEPTED | S04 | S04 (dataclasses, schema_version) |
 | ADR-005 | Изоляция shell / MCP / adapters | PENDING-PROTOTYPE | S20–S22, S37 | S02 (проверка среды) → S20 |
 | ADR-006 | Локальные модели и хранилище секретов | PROPOSED | S09, S12 | S09 (нужен выбор пользователя) |
 | ADR-007 | SQLite schema strategy и backup | PROPOSED | S05 | S05 |
@@ -179,19 +179,35 @@
 
 ## ADR-004 — Сериализация схем и версия manifests
 
-**Контекст.** §14 требует единые форматы ошибок и tool contracts; §4.9 прямо говорит: «Реальный формат требует формальной JSON Schema и миграций версий». §17 требует диапазонов поддерживаемых версий API.
+**Контекст.** §14 требует единые форматы ошибок и tool contracts; §4.9 прямо говорит: «Реальный формат требует формальной JSON Schema и миграций версий». §17 требует диапазоны поддерживаемых версий API.
 
 **Варианты.**
 1. JSON Schema как канон + YAML/JSON представления на диске.
-2. Только dataclass/pydantic-подобные модели в коде (схема выводится из кода).
+2. Только dataclass-подобные модели в коде (схема выводится из кода).
 3. Protobuf/FlatBuffers (эффективно, но плохо для человекочитаемых манифестов).
 
-**Решение.** НЕ ПРИНЯТО, но зафиксированы обязательные свойства, из которых вариант 1 выходит вероятным фаворитом: манифесты и конфиги должны быть человекочитаемы и редактируемы (§1.1), валидируемы вне рантайма (`seraphim config validate`, §12.4), версионируемы (`schema_version`), round-trip safe (сохранять неизвестные опциональные поля).
+**Решение.** Принят вариант 2: **Python dataclasses с ручным `to_dict()`/`from_dict()` и `schema_version: int`**.
 
-**Последствия.** Выбор библиотеки валидации — первая внешняя зависимость проекта, требует обоснования в S04.
+Обоснование:
+- S03 установил **ноль production-зависимостей**; pydantic/jsonschema — внешняя зависимость, которая для ближайших этапов (S05–S10) не нужна: валидация через `__post_init__` с `SeraphimError` достаточна.
+- Человекочитаемость (§1.1) достигается через dataclass-определения; YAML/JSON-представления на диске добавляются через `to_dict()`/`from_dict()`.
+- Версионирование: `schema_version: int` на каждом persisted-объекте. Minor (опциональное поле) → consumer сохраняет unknown optional, игнорирует при обработке. Major (обязательное поле удалено/добавлено) → `CONTRACT_VERSION_UNSUPPORTED`.
+- Round-trip safe: `_extra_fields` сохраняет неизвестные опциональные поля при десериализации.
+- JSON Schema export отложен до момента, когда появится конкретный потребитель (S41 Integration Manifest, S34 Skill manifest).
 
-**Статус:** PROPOSED
-**Дата:** 13.10.2026 · **Пересмотр:** S04
+Обязательные свойства (сохранены из предыдущей версии ADR):
+- манифесты и конфиги человекочитаемы и редактируемы (§1.1);
+- валидируемы вне рантайма (`seraphim config validate`, §12.4);
+- версионируемы (`schema_version`);
+- round-trip safe (сохранять неизвестные опциональные поля).
+
+**Последствия.**
+- Нет внешней библиотеки валидации — первая production-зависимость не вводится без обоснованной необходимости.
+- При появлении JSON Schema consumers (S41) — export-утилита добавляется локально.
+- Валидация — императивная (`__post_init__`), а не декларативная; для S04–S10 это адекватно.
+
+**Статус:** **ACCEPTED**
+**Дата:** 14.10.2026 · **Пересмотр:** при вводе JSON Schema consumer (S41+)
 
 ---
 
@@ -238,19 +254,27 @@
 
 ## ADR-007 — SQLite schema strategy и backup
 
-**Контекст.** §6.1–6.2 задают SQLite как хранилище метаданных и динамического состояния и перечисляют ~30 целевых сущностей, прямо оговаривая: «Это целевая карта, а не требование создать все таблицы в нулевой миграции». §15 требует restore с проверкой совместимости и миграцией копии.
+**Контекст.** §6.1–6.2 задают SQLite как хранилище метаданных и динамического состояния и перечисляют ~30 целевых сущностей, прямо оговаривая: «Это целевая карта, а не требование создать все таблицы в нулевой миграции». §15 требует restore с проверкой совместимости и миграцией копии. CONTRACTS.md §6.2 фиксирует: transactional, forward-only, immutable checksummed migrations; rollback не поддерживается (восстановление = backup/restore).
 
 **Варианты.**
 1. Минимальные миграции по мере появления рабочих сценариев (соответствует §6.2).
 2. Полная схема сразу (противоречит §6.2).
-3. Без SQL-миграционного фреймворка, ручные скрипты.
+3. Без SQL-миграционного фреймворка, ручные скрипты (не обеспечивает инварианты).
 
-**Решение.** НЕ ПРИНЯТО. Вероятный фаворит — вариант 1. Обязательные инварианты: версионируемая миграция, транзакционное применение, идемпотентность повторного запуска, отсутствие полусозданной схемы при сбое, тестовая БД никогда не равна пользовательской.
+**Решение.** ПРИНЯТО — вариант 1 (incremental forward-only migrations). Реализовано в S05: `seraphim.storage.migrations` — numbered registry, immutable checksummed `Migration` dataclass, transactional `MigrationRunner` (BEGIN/statements/postconditions/bookkeeping/COMMIT или ROLLBACK), idempotent reruns (skips applied versions), refusal-not-patch (rejects untrusted DB: missing bookkeeping table, unknown/gapped versions, edited checksums, schema from newer SERAPHIM). Первая миграция (m0001_kernel) создаёт 5 ядерных таблиц: schema_meta (version + installation_id), sessions, tasks (session FK CASCADE), events (OBSERVATORY), components (REGISTRY minimal metadata). State values (task/step/severity) НЕ ограничены CHECK: state machine owned by CONTRACTS/CORE (S16), эволюционирует быстрее immutable SQL. Rollback out of scope: recovery = backup + restore (§15, CONTRACTS §6.2).
 
-**Последствия.** Выбор миграционного инструмента — внешняя зависимость, требует обоснования в S05.
+**Обязательные инварианты (все реализованы):**
+- Версионируемая нумерованная миграция: registry append-only, no edits, checksums recorded.
+- Транзакционное применение: одна explicit transaction (BEGIN IMMEDIATE ... COMMIT) per migration; any failure → ROLLBACK всей миграции (statements + postconditions + bookkeeping + schema_meta upsert + PRAGMA user_version).
+- Идемпотентность: applied versions skipped (read from schema_migrations), only pending executed.
+- Отсутствие полусозданной схемы: transaction all-or-nothing → failed migration leaves DB = state before that migration.
+- Test DB isolation: tests use tmp_path, no access to `<root>/data/seraphim.sqlite`.
 
-**Статус:** PROPOSED
-**Дата:** 13.10.2026 · **Пересмотр:** S05
+**Последствия.** Ноль внешних зависимостей для миграций (raw sqlite3, CONTRACTS errors). Миграционный движок встроенный (`migrations/runner.py`), schema evolution = append to `MIGRATIONS` tuple. Parameterized queries throughout (ADR-007 implicit security contract: `guard_sql()` rejects multi-statement, interpolation markers, placeholder/param mismatch; `validate_identifier()` enforces ^[a-z_][a-z0-9_]*$ + reserved keyword check). Database path resolution: priority (1) explicit db_path arg, (2) SERAPHIM_DB_PATH env, (3) `<root>/data/seraphim.sqlite` default; relative overrides anchored at root (never escape SERAPHIM root unless allow_external=True).
+
+**Статус:** ACCEPTED
+**Дата:** 13.10.2026 (PROPOSED) → 15.10.2026 (ACCEPTED, S05 pass)
+**Реализация:** S05 — `backend/seraphim/storage/` (db.py, paths.py, migrations/{base,runner,m0001_kernel}.py), 58 new tests, 232/232 PASS.
 
 ---
 

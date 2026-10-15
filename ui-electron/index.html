@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <title>SERAPHIM — Skeleton</title>
+  <style>
+    body {
+      font-family: monospace;
+      background: #0a0a0a;
+      color: #c8e6c9;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      margin: 0;
+    }
+    .status { text-align: center; }
+    .ok { color: #66bb6a; }
+  </style>
+</head>
+<body>
+  <div class="status">
+    <h1>SERAPHIM</h1>
+    <p class="ok">VESSEL skeleton loaded.</p>
+    <p id="version"></p>
+  </div>
+  <script>
+    const v = window.seraphim ? window.seraphim.version : "n/a";
+    document.getElementById("version").textContent = "skeleton: " + v;
+  </script>
+</body>
+</html>

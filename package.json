@@ -1,0 +1,18 @@
+{
+  "name": "seraphim-vessel",
+  "version": "0.1.0",
+  "description": "SERAPHIM desktop shell (Electron VESSEL)",
+  "private": true,
+  "main": "ui-electron/main.cjs",
+  "scripts": {
+    "dev": "electron ui-electron/main.cjs",
+    "build": "echo 'Build not yet implemented (S77)'",
+    "lint": "echo 'No JS/TS linter configured for S03 skeleton'",
+    "test": "echo 'No Electron tests for S03 skeleton'"
+  },
+  "devDependencies": {
+    "electron": "^44.0.0"
+  },
+  "author": "",
+  "license": "Proprietary"
+}

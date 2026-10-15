@@ -1,40 +1,64 @@
-# Python
-.venv/
-venv/
+# ── Python ──────────────────────────────────────────────────────────────────
 __pycache__/
 *.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+dist/
+target/
+build/
+*.whl
+.venv/
+venv/
+env/
+*.pyc
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
 
-# Node.js
+# ── Node / Electron ─────────────────────────────────────────────────────────
 node_modules/
+ui-electron/node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
 
-# Build outputs
-target/
+# ── Electron build artifacts ────────────────────────────────────────────────
 dist/
-build/
-coverage/
+out/
+*.o
+*.bin
 
-# Local secrets
+# ── IDE / Editor ────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ── SERAPHIM runtime data (never committed) ─────────────────────────────────
+data/*.sqlite
+data/*.sqlite-wal
+data/*.sqlite-shm
+logs/
+artifacts/
+*.log
+
+# ── Secrets and sensitive files ─────────────────────────────────────────────
+.secrets/
+*.key
+*.pem
+*.p12
+*.pfx
+credentials/
 .env
 .env.*
 !.env.example
 
-# Local runtime data
-data/*.sqlite
-data/*.sqlite-*
-logs/
-artifacts/
-
-# Temporary files
-*.log
-.DS_Store
-Thumbs.db
-
-# Internal project documentation
-
-# S02 Prototype (isolated, not production)
+# ── Prototype artifacts (isolated in prototypes/) ────────────────────────────
 prototypes/**/.s02-port
 prototypes/**/logs/
 prototypes/**/gen/
@@ -43,3 +67,9 @@ prototypes/**/Cargo.lock
 prototypes/**/__pycache__/
 prototypes/**/*.pdb
 prototypes/**/*.exe
+prototypes/**/*.dll
+prototypes/**/*.so
+prototypes/**/*.dylib
+
+# ── Temporary / test roots ─────────────────────────────────────────────────
+shared/testroot/.seraphim-state/

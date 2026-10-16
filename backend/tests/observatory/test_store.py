@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 from seraphim.contracts.events import Event
+from seraphim.contracts.sanitization import register_known_secret
 from seraphim.observatory.store import EventStore
 from seraphim.storage.db import Database
 
@@ -264,3 +265,37 @@ def test_store_ordering_by_timestamp(temp_db: Database) -> None:
     assert loaded[0].payload["seq"] == 2
     assert loaded[1].payload["seq"] == 1
     assert loaded[2].payload["seq"] == 0
+
+
+def test_store_sanitizes_payload_at_write_boundary(temp_db: Database) -> None:
+    """S09: a payload mutated after construction is still scrubbed on save.
+
+    ``Event.__post_init__`` scrubs the payload, but the dict is mutable, so the
+    write boundary must sanitize too — otherwise a secret could reach SQLite.
+    """
+    marker = "SERAPHIM_TEST_SECRET_xyz789"
+    register_known_secret(marker)
+    store = EventStore(temp_db)
+
+    event = Event(type="test.mutated", component="test", payload={"note": "clean"})
+    event.payload["leaked"] = marker
+    event.payload["api_key"] = marker
+    store.save(event)
+
+    rows = temp_db.query("SELECT payload_json FROM events WHERE id = ?", (event.id,))
+    stored = rows[0]["payload_json"]
+    assert marker not in stored
+    assert "[REDACTED]" in stored
+
+
+def test_store_sanitizes_pattern_secret_at_write_boundary(temp_db: Database) -> None:
+    """A provider-format key never reaches SQLite, even without registration."""
+    literal = "sk-ant-api03-abcdefghijklmnopqrstuv"
+    store = EventStore(temp_db)
+
+    event = Event(type="test.pattern", component="test", payload={"note": "clean"})
+    event.payload["leaked"] = literal
+    store.save(event)
+
+    rows = temp_db.query("SELECT payload_json FROM events WHERE id = ?", (event.id,))
+    assert literal not in rows[0]["payload_json"]

@@ -5,6 +5,7 @@ import json
 import logging
 from io import StringIO
 
+from seraphim.contracts.sanitization import SecretRedactor, register_known_secret
 from seraphim.observatory.logger import Logger
 
 
@@ -137,3 +138,74 @@ def test_logger_marker_secret_redaction() -> None:
 
     finally:
         test_logger.removeHandler(handler)
+
+
+def test_logger_known_secret_redacted_without_pattern() -> None:
+    """S09: a secret known to the process is redacted even without a pattern.
+
+    Pattern matching alone would miss a bare marker value in free text; the
+    SecretRedactor closes that gap for values read from the secret store.
+    """
+    marker = "SERAPHIM_TEST_SECRET_xyz789"
+    redactor = SecretRedactor([marker])
+    logger = Logger("test_known", redactor=redactor)
+
+    stream = StringIO()
+    handler = logging.StreamHandler(stream)
+    handler.setLevel(logging.INFO)
+    target = logging.getLogger("seraphim.test_known")
+    target.addHandler(handler)
+    target.setLevel(logging.INFO)
+
+    try:
+        logger.info(f"connecting with {marker} please ignore", note=marker)
+        output = stream.getvalue()
+        assert marker not in output, "Known secret leaked into logs!"
+        assert "[REDACTED]" in output
+    finally:
+        target.removeHandler(handler)
+
+
+def test_logger_without_redactor_still_pattern_scrubs() -> None:
+    """The redactor is optional; the default path keeps pattern redaction."""
+    logger = Logger("test_plain")
+    stream = StringIO()
+    handler = logging.StreamHandler(stream)
+    handler.setLevel(logging.INFO)
+    target = logging.getLogger("seraphim.test_plain")
+    target.addHandler(handler)
+    target.setLevel(logging.INFO)
+
+    try:
+        logger.info("key sk-abcdef1234567890abcdef")
+        output = stream.getvalue()
+        assert "sk-abcdef1234567890abcdef" not in output
+        assert "[REDACTED]" in output
+    finally:
+        target.removeHandler(handler)
+
+
+def test_logger_without_redactor_scrubs_registered_secret() -> None:
+    """S09 review F1: no ``redactor`` argument is needed for a store-read value.
+
+    Registering a value (which the secret store does on every read) is enough
+    for the default logger path to remove it — even in free text under a neutral
+    field name, where no pattern would match.
+    """
+    marker = "SERAPHIM_TEST_SECRET_xyz789"
+    register_known_secret(marker)
+    logger = Logger("test_registry")
+    stream = StringIO()
+    handler = logging.StreamHandler(stream)
+    handler.setLevel(logging.INFO)
+    target = logging.getLogger("seraphim.test_registry")
+    target.addHandler(handler)
+    target.setLevel(logging.INFO)
+
+    try:
+        logger.info(f"connecting with {marker} please ignore", note=marker)
+        output = stream.getvalue()
+        assert marker not in output, "Registered secret leaked into logs!"
+        assert "[REDACTED]" in output
+    finally:
+        target.removeHandler(handler)

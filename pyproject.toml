@@ -10,8 +10,13 @@ description = "SERAPHIM agent runtime — backend core"
 requires-python = ">=3.11"
 # License not specified for skeleton; add proper SPDX expression at S77.
 
+# --- Production dependencies --------------------------------------------------
+dependencies = [
+    "click>=8.1.0,<9",
+    "pyyaml>=6.0.0,<7",
+]
+
 # --- Development dependencies (S03 skeleton only) ----------------------------
-# No production dependencies yet. Agent-related libraries are not installed.
 [project.optional-dependencies]
 dev = [
     "ruff>=0.4.0,<1",
@@ -49,6 +54,10 @@ line-ending = "lf"
 [tool.setuptools.packages.find]
 include = ["seraphim*"]
 namespaces = false
+
+# --- CLI entry point ----------------------------------------------------------
+[project.scripts]
+seraphim = "seraphim.cli.main:cli"
 
 # --- pytest configuration -----------------------------------------------------
 [tool.pytest.ini_options]

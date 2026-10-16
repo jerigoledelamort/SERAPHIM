@@ -9,6 +9,7 @@ from typing import Any
 
 from seraphim.contracts.errors import ErrorCode, SeraphimError
 from seraphim.contracts.events import Event
+from seraphim.contracts.sanitization import sanitize_dict
 from seraphim.storage.db import Database
 
 logger = logging.getLogger(__name__)
@@ -43,7 +44,10 @@ class EventStore:
             msg = f"Event must be Event instance, got {type(event).__name__}"
             raise TypeError(msg)
 
-        payload_json = json.dumps(event.payload) if event.payload else "{}"
+        # Sanitize at the write boundary as well: ``Event.__post_init__`` scrubs
+        # the payload when it is constructed, but the dict is mutable, so a later
+        # mutation could otherwise persist a secret to SQLite (TB-7, S09).
+        payload_json = json.dumps(sanitize_dict(event.payload)) if event.payload else "{}"
 
         try:
             self.db.execute(

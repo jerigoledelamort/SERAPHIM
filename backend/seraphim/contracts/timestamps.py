@@ -3,14 +3,14 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 _TS_RE = None  # Lazy-compiled on first use.
 
 
 def now_utc() -> str:
     """Return current UTC time as an ISO 8601 string with 'Z' suffix."""
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
 def validate_timestamp(ts: str) -> str:

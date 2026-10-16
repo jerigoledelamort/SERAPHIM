@@ -7,7 +7,7 @@ import json
 import logging
 from typing import Any
 
-from seraphim.contracts.sanitization import sanitize_dict, sanitize_text
+from seraphim.contracts.sanitization import SecretRedactor, sanitize_dict, sanitize_text
 
 logger = logging.getLogger(__name__)
 
@@ -17,11 +17,23 @@ class Logger:
 
     All payloads are sanitized before logging.
     Uses Python logging infrastructure with structured JSON output.
+
+    A ``redactor`` may be supplied so that secrets *known to the process* (for
+    example values read from the secret store) are removed by exact match, in
+    addition to the generic pattern scrub.  Without it, only pattern matching
+    applies.
     """
 
-    def __init__(self, component: str) -> None:
+    def __init__(self, component: str, *, redactor: SecretRedactor | None = None) -> None:
         self.component = component
         self._logger = logging.getLogger(f"seraphim.{component}")
+        self._redactor = redactor
+
+    def _scrub_text(self, text: str) -> str:
+        return self._redactor.redact(text) if self._redactor else sanitize_text(text)
+
+    def _scrub_fields(self, fields: dict[str, Any]) -> dict[str, Any]:
+        return self._redactor.redact_dict(fields) if self._redactor else sanitize_dict(fields)
 
     def info(self, message: str, **fields: Any) -> None:
         """Log INFO with structured fields."""
@@ -42,8 +54,8 @@ class Logger:
     def _log(self, level: str, message: str, fields: dict[str, Any]) -> None:
         """Internal log handler with sanitization."""
         # Sanitize message and fields
-        safe_message = sanitize_text(message)
-        safe_fields = sanitize_dict(fields) if fields else {}
+        safe_message = self._scrub_text(message)
+        safe_fields = self._scrub_fields(fields) if fields else {}
 
         # Build structured record
         record = {

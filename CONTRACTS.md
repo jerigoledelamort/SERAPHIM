@@ -70,9 +70,9 @@
 | **Входы** | Файлы из `config/`, `identity/`; команды CLI (seraphim config); GUI-настройки (через VESSEL→CORE API) |
 | **Выходы** | Нормализованный конфигурационный объект (read-only snapshot); валидированная identity; секреты в защищённом хранилище; schema-валидированные данные |
 | **Запретные обязанности** | Не управляет задачами; не выполняет действия на внешних системах; не изменяет политику AEGIS; не хранит динамическое состояние задач; не хранит секреты в открытом тексте |
-| **Владелец состояния** | SANCTUM владеет конфигурационным объектом и identity; файл `config/` + `identity/` — источник истины |
+| **Владелец состояния** | SANCTUM владеет конфигурационным объектом и identity; файл `config/` + `identity/` — источник истины; значения секретов — платформенное хранилище (S09) |
 | **События** | config.loaded, config.changed, config.validation_failed, identity.loaded, secret.accessed |
-| **Ошибки** | CONFIG_FILE_NOT_FOUND, CONFIG_SCHEMA_INVALID, SECRET_ACCESS_DENIED, CONFIG_CONFLICT_DETECTED |
+| **Ошибки** | CONFIG_FILE_NOT_FOUND, CONFIG_SCHEMA_INVALID, SECRET_ACCESS_DENIED, SECRET_NOT_FOUND, SECRET_REF_INVALID, SECRET_STORE_UNAVAILABLE, CONFIG_CONFLICT_DETECTED |
 
 ### 2.3. AEGIS — безопасность и разрешения
 
@@ -414,7 +414,13 @@
 | Источник | Местоположение |
 |---|---|
 | API keys, токены | Защищённое хранилище ОС (Windows Credential Manager) или зашифрованный файл внутри корня |
-| Не хранится в: | YAML-конфиг, логи, экспорты (по умолчанию), фикстуры тестов |
+| Реализация S09 | `SecretStore`; backend по умолчанию — Windows DPAPI (шифртекст в `<root>/data/secrets/<ref>.bin`); при отсутствии безопасного backend — fail-closed (`SECRET_STORE_UNAVAILABLE`), plaintext-fallback отсутствует |
+| В конфиге | только `secret_ref` (логическое имя, `^[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?$`); literal-ключ в конфиге → `SECRET_REF_INVALID`; для `mcp.servers[].env`/`command` literal-секрет отвергается тем же кодом |
+| Не хранится в: | YAML-конфиг, SQLite, логи, экспорты (по умолчанию), фикстуры тестов |
+| В экспорте | `secret_ref` (ссылка) и метаданные backend; значение не включается (`secrets.included = false`); builder вызывает свой verifier и отказывается возвращать payload с секретом (`DIAGNOSTIC_EXPORT_FAILED`) |
+| Значение прочитано процессом | регистрируется process-wide (`register_known_secret`); `sanitize_text`/`sanitize_dict` (ошибки, логи, события, экспорт) удаляют его точным совпадением, независимо от формата |
+| Под `*_ref`-ключом | сохраняется только reference-образное значение; всё прочее (пробелы, uppercase, разделители пути, распознанный формат ключа, не-строка) → `[REDACTED]` |
+| Перед внешней передачей | privacy gate: `evaluate_transmission` / `assert_transmission_allowed` (по умолчанию внешняя передача запрещена) |
 
 ### 4.5. Кэш
 
@@ -622,7 +628,7 @@
 | ADR | Вопрос | Что нужно от пользователя / среды |
 |---|---|---|
 | ADR-005 | Изоляция shell / MCP / адаптеров | Проверка, что выборочная изоляция работает на Windows 11 Home без админских прав |
-| ADR-006 | Секреты и локальные модели | Выбор: Credential Manager vs шифрованный файл в корне; запускает ли SERAPHIM локальный сервер модели |
+| ADR-006 | Секреты и локальные модели | **Секреты решены в S09** (DPAPI-файл внутри корня через `SecretStore`; подтвердить или выбрать Credential Manager). Открыто: запускает ли SERAPHIM локальный сервер модели |
 | ADR-017 | Повторное использование кода ProjectMemory | Существует ли этот код вне репозитория и под какой лицензией (§4.6 упоминает его как существующий) |
 
 ### 12.3. Контрактные вопросы — решение на C1

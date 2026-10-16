@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import StrEnum
 from typing import Any
 
 from seraphim.contracts.constants import SEVERITY_LEVELS
@@ -18,7 +18,7 @@ from seraphim.contracts.timestamps import now_utc, validate_timestamp
 _EVENT_TYPE_RE = re.compile(r"^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*){1,2}$")
 
 
-class Severity(str, Enum):
+class Severity(StrEnum):
     INFO = "INFO"
     WARN = "WARN"
     ERROR = "ERROR"

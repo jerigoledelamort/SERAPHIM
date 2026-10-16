@@ -1,0 +1,9 @@
+# Golden snapshots of the prompt composer's exact output.
+# Empty profile fields render as "key: " with an intentional trailing space,
+# so blank-at-eol is disabled for these five files only. No other whitespace
+# check is relaxed and no global exception is added.
+backend/tests/sanctum/snapshots/layer_order.txt whitespace=-blank-at-eol
+backend/tests/sanctum/snapshots/missing_files.txt whitespace=-blank-at-eol
+backend/tests/sanctum/snapshots/overrides.txt whitespace=-blank-at-eol
+backend/tests/sanctum/snapshots/project_scope.txt whitespace=-blank-at-eol
+backend/tests/sanctum/snapshots/prompt_injection.txt whitespace=-blank-at-eol

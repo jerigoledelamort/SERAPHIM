@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from seraphim.contracts.sanitization import sanitize_dict, strip_traceback
+from seraphim.contracts.sanitization import sanitize_dict, sanitize_text, strip_traceback
 
 
 class ErrorCode:
@@ -33,12 +33,16 @@ class ErrorCode:
     CONFIG_FILE_NOT_FOUND = "CONFIG_FILE_NOT_FOUND"
     CONFIG_SCHEMA_INVALID = "CONFIG_SCHEMA_INVALID"
     SECRET_ACCESS_DENIED = "SECRET_ACCESS_DENIED"
+    SECRET_NOT_FOUND = "SECRET_NOT_FOUND"
+    SECRET_REF_INVALID = "SECRET_REF_INVALID"
+    SECRET_STORE_UNAVAILABLE = "SECRET_STORE_UNAVAILABLE"
     CONFIG_CONFLICT_DETECTED = "CONFIG_CONFLICT_DETECTED"
 
     # --- AEGIS ---
     POLICY_EVALUATION_FAILED = "POLICY_EVALUATION_FAILED"
     UNTRUSTED_DATA_DETECTED = "UNTRUSTED_DATA_DETECTED"
     INSUFFICIENT_PERMISSIONS = "INSUFFICIENT_PERMISSIONS"
+    PRIVACY_TRANSMISSION_DENIED = "PRIVACY_TRANSMISSION_DENIED"
 
     # --- COMPASS ---
     NO_MODEL_AVAILABLE = "NO_MODEL_AVAILABLE"
@@ -166,7 +170,10 @@ class SeraphimError(Exception):
         self.code = code
         self.message_key = _code_to_message_key(code)
         self.component = component
-        self.safe_message = safe_message
+        # ``safe_message`` is sanitized at construction time: an adapter must not
+        # be able to leak a key value through an error message (TB-7).  It is the
+        # only user-visible free-text field (see ``to_diagnostic_dict``).
+        self.safe_message = sanitize_text(safe_message)
         self.retryable = retryable
         self.user_action_required = user_action_required
         self.details_ref = details_ref
@@ -175,7 +182,7 @@ class SeraphimError(Exception):
         self.tool_call_id = tool_call_id
         # Sanitize provided details at construction time.
         self.sanitized_details: dict[str, Any] = sanitize_dict(details) if details else {}
-        super().__init__(safe_message or code)
+        super().__init__(self.safe_message or code)
 
     # -- User-facing serialization (safe for UI/CLI) -------------------------
 

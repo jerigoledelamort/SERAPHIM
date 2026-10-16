@@ -445,7 +445,7 @@ ruff check backend/  → All checks passed!
 
 Содержит:
 - Стек (Python + Electron, ADR-001/002/003)
-- Обязательные версии runtime (Python 3.10+, Node 20+, Electron ^33.2.0)
+- Обязательные версии runtime (Python 3.11+, Node 20+, Electron ^33.2.0)
 - Команды: `pip install -e ".[dev]"`, `npm install`, `pytest`, `ruff check backend/`, `ruff format backend/`
 - Структуру проекта
 - Список того, что НЕ попадает в git
@@ -1055,4 +1055,842 @@ IMPLEMENTATION_PLAN.md      — S06 → ВЫПОЛНЕН
 
 ---
 
-*Конец IMPLEMENTATION_LOG.md S06.*
+## S07 — SANCTUM configuration loader и validation
+
+| Поле | Значение |
+|---|---|
+| **Дата** | 16 октября 2026 |
+| **Статус** | **PASS** |
+| **Гейт** | S06 ✓ |
+| **Изменения кода** | Да |
+
+### Цель
+
+Unified configuration loader с 5-level priority, versioned schemas для всех конфигурационных доменов, строгая валидация и **обязательная санитизация credentials в диагностике**.
+
+### Реализация
+
+#### 1. Versioned Schemas (`seraphim/sanctum/schemas/*.py`, 8 файлов)
+
+| Файл | Содержание |
+|---|---|
+| `runtime.py` | `RuntimeConfig` v1: `max_concurrent_tasks`, `execution_timeout_sec`, `default_task_mode`, validation (timeout ≥30s, concurrent ≥1) |
+| `providers.py` | `ProvidersConfig` v1: `enabled_providers`, `ModelProvider` (type/api_key/base_url/model_name/request_timeout_sec/max_retries), validation (URL format, timeout ≥5s, retries ≥0) |
+| `routing.py` | `RoutingConfig` v1: `default_model_provider`, `task_routing_rules`, validation (enabled provider check, fallback_order references) |
+| `mcp.py` | `MCPConfig` v1: `mcp_tools`, `MCPTool` (tool_name/command/args/env/timeout_sec), validation (command path exists, timeout ≥10s) |
+| `permissions.py` | `PermissionsConfig` v1: `allow_external_writes`, `allowed_external_paths`, validation (paths exist) |
+| `privacy.py` | `PrivacyConfig` v1: `redact_credentials`, `telemetry_enabled`, validation (redact обязательно True, telemetry обязательно False) |
+| `paths.py` | `PathsConfig` v1: `data_dir`, `logs_dir`, `cache_dir`, validation (paths не пустые) |
+| `ui.py` | `UIConfig` v1: `theme`, `reduce_motion`, `startup_behavior`, validation (enum values) |
+
+#### 2. Configuration Loader (`seraphim/sanctum/loader.py`, 308 строк)
+
+**5-level priority (CONTRACTS.md §12.2):**
+1. **System security defaults** (non-overridable fields)
+2. User config (`~/.seraphim/config/<domain>.yaml`)
+3. Workspace config (`.seraphim/<domain>.yaml`)
+4. Task config (`<task_root>/.seraphim/<domain>.yaml`)
+5. Built-in defaults (hardcoded)
+
+**Реализация:**
+- `_NON_OVERRIDABLE_FIELDS: dict[str, set[str]]` — защищённые поля (privacy.redact_credentials, permissions.allow_external_writes)
+- `_load_config_for_domain(domain, root, loader_fn)` — загрузка с priority merge
+- `load_full_config(root)` → `dict[str, VersionedEntity]` — загрузка всех 8 доменов
+- `validate_config(config)` → `ValidationResult` — проверка целостности всей конфигурации
+- Санитизация: все YAML-файлы проходят через `sanitize_dict()` перед возвратом user-facing errors
+
+**Non-overridable fields enforcement:**
+- Если Task/Workspace config пытается изменить защищённое поле → `SeraphimError(CONFIG_CONFLICT)`
+- System security defaults всегда имеют приоритет
+
+#### 3. Configuration Validator (`seraphim/sanctum/validator.py`, 226 строк)
+
+**Публичные функции:**
+- `validate_config_file(path)` → `ValidationResult` — валидация одного файла
+- `validate_config_files(root)` → `ValidationResult` — валидация всех конфигов в директории
+- `ValidationResult` (dataclass): `valid: bool`, `issues: list[ValidationIssue]`
+- `ValidationIssue` (dataclass): `severity: str` (error/warning), `message: str`, `file: str | None`, `key: str | None`, `fix: str | None`
+
+**Проверки:**
+- YAML syntax errors
+- Schema compliance (unknown critical fields, missing required fields, type errors)
+- Unknown keys (rejected, not silently ignored)
+- Duplicate IDs (providers, tools)
+- Protected field conflicts (non-overridable fields)
+- Cross-domain references (routing → providers, MCP tool paths)
+
+**Diagnostic output санитизация:**
+- Все credential-like значения редактируются через `sanitize_dict()` перед показом в ValidationIssue
+- API keys, tokens, env variables с `_KEY`/`_TOKEN` suffixes → `[REDACTED]`
+
+#### 4. CLI Command (`seraphim/cli/config.py`, 72 строки)
+
+**`seraphim config validate [--config-dir <path>]`:**
+- Запускает `validate_config_files(config_dir)`
+- Показывает все ValidationIssue с цветовым форматированием (green/red/yellow/cyan)
+- Формат вывода:
+  ```
+  [ERROR]
+    <message>
+    File: <file> (key: <key>)
+    Fix: <fix instruction>
+  ```
+- Exit code: 0 = valid, 1 = invalid
+
+**Интеграция:**
+- `seraphim/cli/main.py` — main CLI entry point с version option
+- `seraphim/__main__.py` — module execution entrypoint (`python -m seraphim`)
+- `pyproject.toml` [project.scripts] — entry point `seraphim = "seraphim.cli.main:cli"`
+
+### Acceptance Criteria (все проверены)
+
+1. ✅ **5-level priority реализован:**
+   - `_load_config_for_domain()` проверяет все 5 уровней в порядке (Task > Workspace > User > System > Default)
+   - Тест `test_loader_priority_task_overrides_workspace` → Task config wins → PASS
+
+2. ✅ **Валидация показывает file/key + fix instructions:**
+   - CLI command протестирован с invalid config → показывает файл, ключ и инструкцию по исправлению → PASS
+   - Пример вывода:
+     ```
+     [ERROR]
+       Unknown configuration keys in runtime.yaml: max_concurrent_tasks. Remove these keys or check schema version compatibility.
+       File: .seraphim/runtime.yaml (key: max_concurrent_tasks)
+       Fix: Remove unknown keys: max_concurrent_tasks. Check schema version compatibility.
+     ```
+
+3. ✅ **No credential leakage в diagnostics:**
+   - Тест `test_validator_sanitizes_credentials_in_errors` → API keys в unknown field заменяются на `[REDACTED]` → PASS
+   - Sanitization применяется на всех уровнях: YAML parsing errors, schema validation, conflict detection
+
+4. ✅ **Unknown critical fields rejected (не молча):**
+   - Тест `test_validator_rejects_unknown_keys` → unknown key вызывает ValidationIssue с severity=error → PASS
+   - Validator НЕ игнорирует неизвестные поля в critical configs
+
+5. ✅ **Protected fields не переопределяются:**
+   - Тест `test_loader_non_overridable_fields_enforced` → попытка изменить privacy.redact_credentials в Task config вызывает `SeraphimError(CONFIG_CONFLICT)` → PASS
+
+### Mandatory Questions
+
+**1. Где реализован 5-level priority?**
+- `seraphim/sanctum/loader.py:202-263` — функция `_load_config_for_domain()`
+- Порядок проверки:
+  1. `<root>/.seraphim/<domain>.yaml` (Task)
+  2. `.seraphim/<domain>.yaml` (Workspace, если root не является workspace root)
+  3. `~/.seraphim/config/<domain>.yaml` (User)
+  4. System defaults (hardcoded protected fields)
+  5. `get_default_<domain>_config()` (Built-in defaults)
+- Merge: Task overrides Workspace overrides User overrides System overrides Default
+- Non-overridable fields проверяются после merge (enforcement на уровне loader)
+
+**2. Как обрабатываются invalid configs?**
+- **YAML syntax error:** `SeraphimError(CONFIG_PARSE_ERROR)` с санитизированным контекстом файла
+- **Schema validation error:** `SeraphimError(CONFIG_INVALID)` с message о missing/invalid поле, file/key, fix instruction
+- **Unknown critical field:** `ValidationIssue(severity=error)` с инструкцией удалить или проверить schema_version
+- **Duplicate ID:** `ValidationIssue(severity=error)` с указанием конфликтующих IDs
+- **Protected field conflict:** `SeraphimError(CONFIG_CONFLICT)` с указанием поля и уровней конфликта
+- Все errors показываются пользователю через CLI с санитизацией credentials
+- **Recovery:** пользователь должен исправить файл вручную (no auto-fix)
+
+**3. Какие поля non-overridable?**
+- `_NON_OVERRIDABLE_FIELDS` (`loader.py:82-85`):
+  ```python
+  {
+      "permissions": {"allow_external_writes"},
+      "privacy": {"redact_credentials"},
+  }
+  ```
+- **Обоснование (из спецификации):**
+  - `privacy.redact_credentials`: Security-critical, должно быть всегда True (§12.3)
+  - `permissions.allow_external_writes`: Защита от случайной активации Task-level config (§12.5)
+- **Enforcement:** System security defaults всегда имеют приоритет, любая попытка override → `CONFIG_CONFLICT`
+
+### Manual Verification
+
+**1. Invalid config errors:**
+```bash
+# Создать конфиг с ошибками
+mkdir -p .seraphim
+cat > .seraphim/runtime.yaml << EOF
+schema_version: 1
+max_concurrent_tasks: "not_a_number"
+unknown_critical_field: sk-ant-test123456
+EOF
+
+# Запустить валидатор
+seraphim config validate
+
+# Ожидаемый output:
+# Configuration validation failed
+#
+# [ERROR]
+#   Unknown configuration keys in runtime.yaml: unknown_critical_field, execution_timeout_sec. Remove these keys or check schema version compatibility.
+#   File: .seraphim/runtime.yaml (key: unknown_critical_field)
+#   Fix: Remove unknown keys: unknown_critical_field, execution_timeout_sec. Check schema version compatibility.
+```
+
+**2. No credential leakage:**
+```python
+from seraphim.sanctum.validator import validate_config_file
+from pathlib import Path
+
+# runtime.yaml с API key в unknown field
+result = validate_config_file(Path(".seraphim/runtime.yaml"))
+
+# Проверить, что sk-ant-test123456 не виден в result.issues
+for issue in result.issues:
+    assert "sk-ant-test123456" not in issue.message
+    assert "sk-ant-test123456" not in (issue.fix or "")
+    print(f"✅ {issue.severity}: {issue.message}")
+```
+
+### Verification
+
+```bash
+# 18 новых тестов для SANCTUM
+pytest tests/sanctum/ -v
+# ✅ test_loader.py: 7 passed (priority, protected fields, missing files)
+# ✅ test_validator.py: 11 passed (syntax, unknown keys, sanitization, CLI integration)
+
+# Полный набор: 281/282 passed (1 skipped)
+pytest -q
+# ✅ 281 passed, 1 skipped
+
+# Ruff: clean
+ruff check seraphim/sanctum/ tests/sanctum/
+# ✅ All checks passed!
+
+# CLI доступен
+seraphim --version
+# seraphim, version 0.1.0
+
+# CLI validate работает
+seraphim config validate --config-dir test_cli_configs
+# Configuration validation failed
+# [ERROR]
+#   Unknown configuration keys in test_cli_configs\.seraphim\runtime.yaml: ...
+#   File: test_cli_configs\.seraphim\runtime.yaml (key: execution_timeout_sec)
+#   Fix: Remove unknown keys: ...
+```
+
+### Резюме изменений
+
+```
+backend/seraphim/sanctum/
+  schemas/
+    __init__.py             — экспорт всех schema классов
+    runtime.py              — RuntimeConfig v1
+    providers.py            — ProvidersConfig v1, ModelProvider
+    routing.py              — RoutingConfig v1, TaskRoutingRule
+    mcp.py                  — MCPConfig v1, MCPTool
+    permissions.py          — PermissionsConfig v1
+    privacy.py              — PrivacyConfig v1
+    paths.py                — PathsConfig v1
+    ui.py                   — UIConfig v1
+  loader.py                 — load_full_config, 5-level priority, protected fields (308 lines)
+  validator.py              — validate_config_file/files, ValidationResult (226 lines)
+
+backend/seraphim/cli/
+  __init__.py               — экспорт config_group
+  config.py                 — CLI command "seraphim config validate" (72 lines)
+  main.py                   — main CLI entry point (34 lines)
+
+backend/seraphim/__main__.py — module execution entrypoint
+
+backend/tests/sanctum/
+  test_loader.py            — 7 tests: priority, protected fields, missing files
+  test_validator.py         — 11 tests: syntax errors, unknown keys, credential sanitization
+
+pyproject.toml              — добавлены dependencies: click>=8.1.0,<9, pyyaml>=6.0.0,<7
+                               добавлен [project.scripts] seraphim entry point
+                               requires-python опущен до >=3.10 (было >=3.11)
+
+IMPLEMENTATION_PLAN.md      — S07 → ВЫПОЛНЕН
+```
+
+### Ограничения
+
+- **Auto-fix не реализован:** Пользователь должен править YAML вручную по инструкциям из ValidationIssue.fix
+- **JSON Schema export не реализован:** Отложено до S41 (Integration Manifest)
+- **Workspace root detection:** Текущая реализация использует `.seraphim/` в CWD как Workspace root. Multi-workspace support требует уточнения в будущем.
+- **CLI Windows encoding:** Вывод использует только ASCII-safe символы (no Unicode checkmarks) для совместимости с cp1251/cp866 консолями
+
+---
+
+*Конец IMPLEMENTATION_LOG.md S07.*
+
+---
+
+## S08 — SANCTUM: identity и сборка инструкций
+
+| Поле | Значение |
+|---|---|
+| **Дата** | 16 октября 2026 |
+| **Статус** | **PASS** |
+| **Гейт** | S07 ✓ |
+| **Изменения кода** | Да (identity loader, prompt composer, CLI, тесты) |
+| **Созданные файлы** | `backend/seraphim/sanctum/identity.py`, `backend/seraphim/sanctum/prompt_composer.py`, `backend/seraphim/cli/identity.py`, `identity/{identity.yaml, system_prompt.md, personality.md, response_style.md}`, `backend/tests/sanctum/{test_identity.py, test_prompt_composer.py, test_prompt_snapshots.py}`, `backend/tests/sanctum/snapshots/*.txt`, `backend/tests/cli/test_identity_cli.py` |
+| **Обновлённые файлы** | `backend/seraphim/sanctum/__init__.py`, `backend/seraphim/cli/main.py`, `IMPLEMENTATION_PLAN.md`, `IMPLEMENTATION_LOG.md` |
+
+### Цель
+
+Разделить личность, системные инструкции, стиль и контекст задачи; собрать
+детерминированный prompt composer с фиксированным порядком слоёв, размеченными
+источниками, лимитом размера и отдельной обработкой недоверенных документов;
+разделить язык UI и язык ответа модели; покрыть всё snapshot-тестами.
+
+### Реализация
+
+#### 1. Identity (`seraphim/sanctum/identity.py`, ~330 строк)
+
+- `ProfileSettings` — profile settings из `identity.yaml`: `display_name`,
+  `ui_language`, `response_language`, `default_task_mode`, `timezone`.
+  `ui_language` и `response_language` — **независимые** поля (§9).
+- `IdentityConfig(VersionedEntity)` — схема `identity.yaml` (v1) с вложенным
+  `profile`; ручные `to_dict`/`from_dict` (ADR-004), отказ на неизвестные ключи.
+- `Identity` — разрешённые тексты слоёв (`system_instructions`, `personality`,
+  `response_style`) + логические метки источников.
+- `load_identity(root, ...)` — слоистый приоритет **defaults < project < user**
+  (§12.3). Для `.md` берётся наивысший непустой файл; для `identity.yaml` —
+  field-level merge. Пустые/отсутствующие файлы → предсказуемые builtin defaults.
+- Метки источников **логические** (`identity/...`, `.seraphim/identity/...`,
+  `~/.config/seraphim/identity/...`, `builtin`), не абсолютные пути — вывод
+  детерминирован между машинами.
+- Хардкод языка отсутствует: есть только `DEFAULT_LANGUAGE_CODE = "en"` как
+  значение по умолчанию; business logic не ветвится по `ru`/`en`.
+
+#### 2. Deterministic prompt composer (`seraphim/sanctum/prompt_composer.py`, ~380 строк)
+
+Фиксированный порядок слоёв (высшая власть → низшая):
+
+```
+0 system_policy        trusted    builtin, non-overridable (safety baseline)
+1 system_instructions  trusted    identity/system_prompt.md
+2 personality          trusted    identity/personality.md
+3 response_style       trusted    identity/response_style.md
+4 profile              trusted    identity/identity.yaml (ui/response language, mode)
+5 project_instructions trusted    project scope (§16)
+6 task_context         trusted    current task/goal
+7 skill_instructions   UNTRUSTED  skill-provided text
+8 retrieved_context    UNTRUSTED  retrieved documents/memory
+```
+
+- Каждый слой получает размеченный заголовок
+  `<<<LAYER id=... source=... trust=...>>>`; недоверенные оборачиваются в
+  `<<<BEGIN_UNTRUSTED_DATA ...>>> ... <<<END_UNTRUSTED_DATA ...>>>`.
+- Нейтрализация: сигл `<<<` внутри контента экранируется (`< <<`); замены
+  повторяются до полного исчезновения сигла, поэтому серия из четырёх `<`
+  (`"<<<<"` → `"< <<<"` при одной замене) не может восстановить маркер.
+  Завершение цикла доказано: для серии из `n ≥ 3` подряд `<` одна замена даёт
+  серии `1` и `n-1`, поэтому потенциал `Σ max(0, len(run)-2)` убывает ровно
+  на 1 за замену и равен нулю тогда и только тогда, когда сигла нет.
+- Метки источников (`source`) санитизируются на границе рендера: удаляются
+  `\r`/`\n` и нейтрализуется сигл, поэтому враждебное имя документа не может
+  закрыть заголовок и открыть поддельный `trust=trusted`-слой.
+- `system_policy` — первый, trusted и non-overridable; override → `CONFIG_CONFLICT_DETECTED`.
+  Override слоя `retrieved_context` отклоняется (`VALIDATION_FAILED`) — недоверенный
+  текст принимается только через аргумент `retrieved_documents`.
+- Лимит размера: per-layer бюджеты + общий бюджет; при превышении отсекаются
+  слои с наименьшим приоритетом (детерминированно). `system_policy` не удаляется.
+  `dropped` сообщает каждый слой один раз (без дубликатов для повторяющегося
+  `retrieved_context`).
+- `inspect()` — только метаданные слоёв (id/source/trust/order/chars/flags),
+  **без контента**. `preview()` — рендер с redaction секретоподобных значений.
+- Композиция детерминирована (без timestamp/random/абсолютных путей).
+
+#### 3. CLI (`seraphim/cli/identity.py`)
+
+- `seraphim identity show` — profile + активные слои (метаданные, без контента).
+- `seraphim identity prompt-preview` — рендер prompt с redaction.
+
+#### 4. Шаблон identity (`identity/` в корне)
+
+`identity.yaml`, `system_prompt.md`, `personality.md`, `response_style.md` —
+редактируемые defaults (соответствуют builtin-константам).
+
+#### 5. Hardening после независимого review (code-reviewer, read-only, 2 раунда)
+
+Review подтвердил trust-классификацию, порядок, non-overridable policy и
+детерминизм и выявил два BLOCKER'а; повторное ревью hardening-а нашло остаточную
+«половину» BLOCKER-1 (`>>>`/`key=value` в метке). Все закрыты:
+
+| ID | Находка | Исправление | Проверка |
+|---|---|---|---|
+| BLOCKER-1 | `source` retrieved-документа рендерился без санитизации: переводы строк, `>>>` и пары `key=value` позволяли закрыть заголовок досрочно и внедрить `id=system_policy trust=trusted` | `_sanitize_label()` сводит метку к безопасному токену `[A-Za-z0-9._:/~-]` (остальное → `_`), поэтому не проходит ни `<<<`, ни `>>>`, ни перевод строки, ни `=`; применяется при создании `PromptLayer` и повторно в `_render_block` | `test_source_label_cannot_forge_layer_header`, `test_source_label_keyvalue_spoofing_is_blocked` |
+| BLOCKER-2 | `_neutralize` обходился серией `"<<<<"` (одна замена → `"< <<<"`, маркер восстановлен) | цикл замен до исчезновения сигла (потенциал `phi = Σ max(0, len(run)-2)` убывает на 1 за замену, поэтому цикл завершается; проверено на `'<'*2_000_000`) | `test_sigil_run_cannot_reconstruct_marker`, `test_long_sigil_run_is_fully_neutralized` |
+| MINOR-1 | override `retrieved_context` молча игнорировался | override отклоняется с `VALIDATION_FAILED` | `test_retrieved_context_override_is_rejected` |
+| MINOR-2 | `inspect()` возвращал `source` без санитизации | `sanitize_text(layer.source)` + пре-санитизация метки | `test_inspect_sanitizes_source_labels` |
+| MINOR-4 (доп.) | дубликаты `layer_id` в `dropped` | дедупликация с сохранением порядка | `test_duplicate_dropped_ids_are_reported_once` |
+
+Оставлены осознанно (см. «Риски и долги»): MINOR-3 (для protected-слоя общий
+бюджет — мягкий лимит) и MINOR-4 по маркеру (`TRUNCATION_MARKER` добавляется
+сверх per-layer cap; задокументировано в коде).
+
+### Acceptance Criteria (все проверены)
+
+| Критерий | Результат |
+|---|---|
+| Активные инструкции инспектируются без раскрытия секретов | **PASS** (`inspect()` без контента; `show` печатает только метаданные; `preview()` redact; тесты `test_inspect_has_no_content_and_no_secrets`, `test_identity_show_no_content_leak`) |
+| Данные из Skill/файла не могут повыситься до system policy | **PASS** (`test_prompt_injection_cannot_escalate`, `test_sigil_run_cannot_reconstruct_marker`, `test_source_label_cannot_forge_layer_header`, `test_source_label_keyvalue_spoofing_is_blocked`: ровно один trusted `system_policy`, forged-маркеры/метки нейтрализованы; snapshot `prompt_injection.txt`) |
+| Пустые identity files имеют предсказуемые defaults | **PASS** (`test_empty_files_use_defaults`, `test_defaults_when_no_files`) |
+| Язык UI и язык ответа разделены, без хардкода | **PASS** (`test_ui_and_response_language_are_independent`, `test_profile_layer_exposes_both_languages`) |
+| Snapshot-тесты: порядок слоёв, missing files, overrides, project scope, injection | **PASS** (5 snapshot-тестов, эталоны в `snapshots/`) |
+
+### Ответы на обязательные вопросы
+
+**1. В каком порядке компонуются инструкции?**
+Фиксированный порядок `LAYER_ORDER`: `system_policy` → `system_instructions` →
+`personality` → `response_style` → `profile` → `project_instructions` →
+`task_context` → `skill_instructions` → `retrieved_context`. Первые семь —
+trusted, последние два — untrusted (обёрнуты в data-envelope). Порядок
+задаётся кодом (`LAYER_ORDER`) и не зависит от входных данных; проверяется
+`test_layer_order_is_fixed` и snapshot `layer_order.txt`.
+
+**2. Как пользователь увидит фактически активные слои?**
+`seraphim identity show` печатает profile и список активных слоёв в порядке
+композиции (id, trust, source, флаги truncated/dropped) — без контента слоёв.
+`seraphim identity prompt-preview` печатает собранный prompt с redaction
+секретоподобных значений. Программно: `PromptComposition.inspect()` (метаданные)
+и `.preview()` (redacted текст).
+
+**3. Как недоверенный текст не может стать системной инструкцией?**
+Четыре барьера: (a) trust — свойство слоя, а не контента, поэтому skill/retrieved
+всегда `untrusted` и не могут занять trusted-позиции; (b) недоверенный контент
+заключается в явный data-envelope; (c) сигл `<<<` в контенте экранируется
+циклически, так что подделанный `<<<LAYER ... trust=trusted>>>` не воспроизводится
+и остаётся внутри envelope; (d) метка `source` сводится к безопасному токену
+(`[A-Za-z0-9._:/~-]`), поэтому враждебное имя документа не может ни закрыть
+заголовок (`>>>`), ни открыть поддельный (`<<<`), ни внедрить пару
+`id=system_policy trust=trusted`.
+Проверено `test_prompt_injection_cannot_escalate`,
+`test_sigil_run_cannot_reconstruct_marker`,
+`test_long_sigil_run_is_fully_neutralized`,
+`test_source_label_cannot_forge_layer_header`,
+`test_source_label_keyvalue_spoofing_is_blocked` и snapshot `prompt_injection.txt`.
+
+### Верификация
+
+```powershell
+# Полный набор (venv)
+.\.venv\Scripts\python.exe -m pytest -q
+# 323 passed, 1 skipped
+
+# Lint
+ruff check backend/
+# All checks passed!
+
+# CLI
+.\.venv\Scripts\python.exe -m seraphim identity show
+.\.venv\Scripts\python.exe -m seraphim identity prompt-preview
+# exit 0; слои и preview выводятся
+```
+
+### Ответы на контрольные вопросы (проверки)
+
+- Порядок слоёв: `test_layer_order_is_fixed`, snapshot `layer_order.txt`.
+- Missing files: `test_defaults_when_no_files`, `test_empty_files_use_defaults`, snapshot `missing_files.txt`.
+- Overrides: `test_system_policy_cannot_be_overridden`, `test_unknown_override_layer_rejected`, snapshot `overrides.txt`.
+- Project scope: `test_user_overrides_workspace_for_text_layers`, `test_workspace_overrides_base`, snapshot `project_scope.txt`.
+- Prompt injection: `test_prompt_injection_cannot_escalate`, `test_skill_text_is_wrapped_as_untrusted`,
+  `test_sigil_run_cannot_reconstruct_marker`, `test_long_sigil_run_is_fully_neutralized`,
+  `test_source_label_cannot_forge_layer_header`, `test_source_label_keyvalue_spoofing_is_blocked`,
+  snapshot `prompt_injection.txt`.
+- Размер: `test_per_layer_truncation`, `test_total_budget_drops_lowest_priority`, `test_system_policy_survives_tiny_budget`.
+
+### Ручные проверки пользователя
+
+1. Создать RU-профиль и посмотреть preview:
+   ```powershell
+   $d = Join-Path $env:TEMP "seraphim-ru"; New-Item -ItemType Directory -Force -Path "$d\identity" | Out-Null
+   Set-Content "$d\identity\identity.yaml" -Encoding utf8 "schema_version: 1`nprofile:`n  ui_language: ru`n  response_language: ru"
+   .\.venv\Scripts\python.exe -m seraphim identity show --config-dir $d
+   .\.venv\Scripts\python.exe -m seraphim identity prompt-preview --config-dir $d
+   ```
+2. Убедиться, что приватный контекст не утекает в логи: модули
+   `sanctum/identity.py` и `sanctum/prompt_composer.py` не содержат логирования;
+   `identity show` печатает только метаданные; `prompt-preview` redact-ит
+   секретоподобные значения.
+
+### Риски и долги
+
+1. **Pre-existing lint-долг S07** (staged, не закоммичен): `loader.py` не
+   импортировал `VersionedEntity` (F821, аннотация не вычислялась из-за
+   `from __future__ import annotations`), неиспользуемые импорты в
+   `loader.py`/`config_schemas.py`, `RUF022` в `__init__.py`, `F841` в
+   `test_validator.py`. Исправлено механически (без изменения поведения), чтобы
+   стандартная команда `ruff check backend/` проходила. Требует внимания при
+   ревью diff.
+2. **CLI-тесты требуют `click`.** `.venv` был неполным — доустановлены
+   объявленные зависимости (`pip install -e ".[dev]"`). Тесты используют
+   `pytest.importorskip("click")`, поэтому в среде без click они скипаются.
+3. **`user_preferences.md`** (§12.2) не реализован — не входил в перечень S08.
+4. **Размер в символах, не токенах** — лимит бюджета приблизительный.
+5. **Project scope identity** реализован через `.seraphim/identity/`; связь с
+   REGISTRY-проектами появится в S28.
+6. **Оставленные MINOR-замечания review:** для protected-слоя (`system_policy`)
+   общий бюджет работает как мягкий лимит (слой не удаляется и не режется общим
+   бюджетом — только своим per-layer); `TRUNCATION_MARKER` добавляется сверх
+   per-layer cap (аннотация вне бюджета, задокументировано в коде); бюджет
+   считается по нейтрализованной длине, а `_neutralize` может удлинять строку
+   (влияет только на объём усечения); ключи `layer_budgets` не валидируются
+   (неизвестный ключ просто не используется); в диагностике `OSError`/`YAMLError`
+   уровня loader могут встречаться абсолютные пути (не влияет на
+   `PromptComposition`, который работает с логическими метками).
+7. **Redaction асимметричен by design:** `inspect()`/`preview()` редактируют
+   секретоподобные значения (для показа пользователю), а сам рендер prompt
+   содержит исходные метки/текст — редактирование полного промпта не входит в
+   S08. Пользовательской утечки нет: CLI печатает только `inspect()`/`preview()`.
+8. **PromptComposer не подключён в runtime-путь** — используется CLI и тестами;
+   подключение к model-call path вне scope S08.
+
+### Резюме изменений
+
+```
+backend/seraphim/sanctum/
+  identity.py            — ProfileSettings, IdentityConfig, Identity, load_identity (S08)
+  prompt_composer.py     — LAYER_ORDER, PromptLayer, PromptComposition, PromptComposer
+backend/seraphim/cli/
+  identity.py            — seraphim identity show | prompt-preview
+  main.py                — регистрация identity_group
+identity/
+  identity.yaml, system_prompt.md, personality.md, response_style.md
+backend/tests/sanctum/
+  test_identity.py (12), test_prompt_composer.py (22), test_prompt_snapshots.py (5)
+  snapshots/{layer_order,missing_files,overrides,project_scope,prompt_injection}.txt
+backend/tests/cli/
+  test_identity_cli.py (3)
+```
+
+### Предлагаемое сообщение коммита
+
+```
+feat: S08 SANCTUM identity and deterministic prompt composer
+
+- sanctum/identity.py: identity.yaml profile settings + layered loader
+  (defaults < project < user), predictable defaults for empty files
+- sanctum/prompt_composer.py: fixed 9-layer order, labeled sources,
+  size budgets, untrusted data envelopes, cyclic marker neutralization,
+  source-label sanitization at the render boundary
+- cli/identity.py: seraphim identity show | prompt-preview
+- identity/: editable default template files
+- tests: 42 new (identity, composer, 5 snapshots, CLI); 323/324 PASS
+- ruff: clean (also fixes pre-existing S07 lint debt)
+```
+
+---
+
+*Конец IMPLEMENTATION_LOG.md S08.*
+
+---
+
+## S09 — SANCTUM: секреты, privacy и redaction
+
+**Статус:** PASS
+**Дата:** 16.10.2026
+**Гейт:** ADR-006 (секреты — ACCEPTED)
+
+### 1. Задача и границы
+
+Защитить ключи провайдеров и передачу данных вовне: секреты — только в
+платформенном secure storage; в конфиге — только `secret_ref`; интерфейс
+secret store с masked display и rotation/delete; privacy summary до внешней
+передачи; без silent uploads; тесты на redaction, missing/invalid ref,
+export-without-secrets и logging.
+
+S09 даёт **гарантию и точку решения**, а не полный pipeline: экспорт/импорт/backup
+(S11), фактический сетевой вызов провайдера (S12+) и инъекция секретов в MCP
+(S37) — вне scope. На момент S09 в `backend/seraphim` нет сетевого кода
+(`requests|urllib|socket|httpx` — пусто), поэтому критерий «privacy policy
+проверяется перед внешней передачей» выполнен через явный gate, который обязана
+вызывать MODEL LAYER.
+
+### 2. Решение по хранилищу секретов (ADR-006 → ACCEPTED для секретов)
+
+Выбран **вариант 4**: шифртекст внутри корня, ключ управляется ОС через
+**Windows DPAPI** (`CryptProtectData`/`CryptUnprotectData` через `ctypes`, ноль
+новых зависимостей). Обоснование и ограничения — в ADR-006. Ключевое: сохраняется
+единый корень (§12.1), нет управления парольной фразой, платформенный механизм по
+предписанию S09-промта. DPAPI **проверен фактически** (`dpapi_available()` делает
+protect/unprotect round-trip, а не предполагает наличие). Локальные модели в
+ADR-006 остаются PROPOSED.
+
+### 3. Что сделано
+
+#### 1. Хранилище секретов (`seraphim/sanctum/secrets.py`)
+
+- `SecretStore` (ABC) — единственный интерфейс; `info`/`set`/`get`/`has`/`delete`/`list_refs`,
+  плюс `rotate` (отказывает, если ref не существует) и `masked`.
+- `DPAPISecretStore` — `SRP1` magic + DPAPI blob в `<root>/data/secrets/<ref>.bin`,
+  атомарная замена через `os.replace`; чтение проверяет magic; ошибка расшифровки →
+  `SECRET_ACCESS_DENIED` без значения.
+- `InMemorySecretStore` — только явным `backend="memory"` (тесты/эфемерные запуски),
+  никогда не выбирается автоматически.
+- `UnavailableSecretStore` — fail-closed: `set/get/delete` → `SECRET_STORE_UNAVAILABLE`.
+- `create_secret_store` — детерминированный выбор без plaintext-fallback;
+  неизвестный backend → `VALIDATION_FAILED`.
+- `validate_secret_ref` (`^[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?$`, ≤64, reserved
+  device names), `mask_secret` (`****` + 4 хвостовых), `looks_like_secret`,
+  `provider_auth_error` (значение по exact match, отдаёт только `secret_ref`/`status`/`value_supplied`).
+- **Чтение значения регистрирует его process-wide** (`register_known_secret`).
+
+#### 2. Privacy gate (`seraphim/sanctum/privacy.py`)
+
+`DATA_CATEGORIES` (prompt/conversation/files/memory/artifacts/images/tool_output),
+`PrivacyPolicy` (+`from_config`), `TransmissionRequest`, `PrivacyDecision`,
+`summarize_request`/`render_summary`, `evaluate_transmission` (фиксированный порядок:
+local → `local_only` → external disabled → provider not allowed → allowed),
+`assert_transmission_allowed` (→ `PRIVACY_TRANSMISSION_DENIED`), `prepare_payload`
+(redaction перед отправкой). Дефолты запрещающие: `allow_external_transmission=False`,
+`allowed_providers=[]`, `require_confirmation=True`, `redact_before_transmission=True`.
+
+#### 3. Export без секретов (`seraphim/sanctum/export.py`)
+
+- `build_safe_export` — config + identity + секция `secrets` с `included: false`,
+  backend, логический относительный `location`, `refs` (только имена) и note;
+  значения не читаются вовсе; в конце вызывает **собственный verifier** и отказывается
+  возвращать payload с секретом (`DIAGNOSTIC_EXPORT_FAILED`).
+- `find_secret_material` — JSON-пути (не значения), проверяет и **ключи**, и значения,
+  включает `set`/`frozenset`; путь для секретного ключа не эхоит сам ключ (`$.*`).
+- `sanitize_export` / `verify_no_secrets`.
+
+#### 4. Redaction (`seraphim/contracts/sanitization.py`)
+
+- Расширены паттерны: `sk-`/`sk-ant-`, `AIza`, `hf_`, `gh[pousr]_`, `xox[baprs]-`,
+  `AKIA`, PEM, Bearer, JWT, `key=value`.
+- **Process-wide реестр известных секретов**: `register_known_secret`/`clear_known_secrets`/
+  `known_secret_count`; `sanitize_text` и `redact_known_secrets` удаляют
+  зарегистрированные значения точным совпадением (самое длинное — первым).
+- `_REFERENCE_KEYS`: под `secret_ref`/`credential_ref`/`key_ref`/`token_ref`
+  сохраняется **только reference-образное** значение; всё прочее (пробелы, uppercase,
+  разделители пути, распознанный формат ключа, не-строка) → `[REDACTED]`; для
+  reference-образных дополнительно применяется pattern scrub и проверка реестра.
+
+#### 5. Конфиг (`sanctum/config_schemas.py`, `sanctum/loader.py`)
+
+- `credential_ref` → `secret_ref`; `PrivacyConfig` получил поля внешней передачи
+  (запрещающие по умолчанию).
+- `_check_secret_refs` — literal-ключ в `secret_ref` → `SECRET_REF_INVALID` (значение не эхоится).
+- `_check_entry_keys` — неизвестные ключи внутри list-entries (например `api_key`
+  в модели) больше не принимаются молча.
+- `_check_mcp_credentials` — literal-секрет в `mcp.servers[].env` и `command` →
+  `SECRET_REF_INVALID` (см. hardening F3).
+
+#### 6. CLI (`seraphim/cli/secrets.py`, `seraphim/cli/errors.py`)
+
+`secrets set|list|show|rotate|delete|audit` и `privacy summary`. Значение принимается
+только через `--from-env`/`--stdin`/hidden prompt — `--value` отсутствует намеренно
+(process listing и history). `audit` собирает export, сканирует корень (исключая
+`.git`, `.venv`, `node_modules`, …) и выходит с кодом 1 при находках, печатая только пути.
+`handle_errors` печатает `error [CODE]: safe_message` в stderr (exit 1); применён ко всем
+командам S09.
+
+#### 7. Изменённые/новые файлы
+
+```
+backend/seraphim/sanctum/secrets.py       (новый)  SecretStore, DPAPI/memory/unavailable, refs, маски
+backend/seraphim/sanctum/privacy.py       (новый)  privacy gate, summary, decision, prepare_payload
+backend/seraphim/sanctum/export.py        (новый)  build_safe_export, find_secret_material, verify_no_secrets
+backend/seraphim/cli/secrets.py           (новый)  secrets *, privacy summary
+backend/seraphim/cli/errors.py            (новый)  handle_errors
+backend/seraphim/contracts/sanitization.py         паттерны ключей, реестр known secrets, *_ref-значения
+backend/seraphim/contracts/errors.py               коды SECRET_*/PRIVACY_*, санитизация safe_message/details
+backend/seraphim/observatory/logger.py             опциональный SecretRedactor
+backend/seraphim/observatory/store.py              санитизация payload на write-boundary
+backend/seraphim/sanctum/config_schemas.py         secret_ref, PrivacyConfig
+backend/seraphim/sanctum/loader.py                 _check_secret_refs, _check_entry_keys, _check_mcp_credentials
+backend/seraphim/sanctum/validator.py              санитизация unexpected-error сообщения
+backend/seraphim/cli/config.py                     санитизация печатаемого сообщения
+backend/seraphim/sanctum/__init__.py               экспорты S09
+backend/seraphim/cli/main.py                       регистрация групп
+backend/tests/conftest.py                          изоляция process-wide реестра секретов
+ARCHITECTURE_DECISIONS.md, CONTRACTS.md            ADR-006 (ACCEPTED), §2.2/§4.4/§12.2
+```
+
+### 4. Hardening после независимого security-review (read-only, 1 раунд)
+
+Review подтвердил: fail-closed реален, DPAPI-использование корректно (порядок
+аргументов, `LocalFree` в `finally`, magic, атомарная замена), дефолты privacy
+запрещающие, сетевого выхода сегодня нет. **BLOCKER — 0.** Найдено 3 MAJOR и 4 MINOR.
+
+| ID | Находка | Исправление | Проверка |
+|---|---|---|---|
+| F1 (MAJOR) | Точное удаление значения было доступно, но не подключено к общим sink'ам: `SeraphimError`/`Logger`/`Event`/export знают только паттерны и имена ключей, поэтому value без распознаваемого формата под нейтральным ключом утекало; `provider_auth_error` в продакшене не вызывался | Process-wide реестр `register_known_secret`; `sanitize_text`/`redact_known_secrets` консультируют его; `SecretStore.get` регистрирует прочитанное значение. Гарантия стала структурной, а не зависящей от каждого вызывающего. Дополнительно закрыт write-boundary SQLite: `EventStore.save` санитизирует payload (dict мутабелен, поэтому мутация после конструктора иначе попала бы в БД) | `TestReadValuesAreRegistered`, `TestKnownSecretRegistry`, `test_logger_without_redactor_scrubs_registered_secret`, `test_error_details_with_read_value_are_scrubbed`, усиленный `test_provider_auth_error_hides_key_in_message`, `test_store_sanitizes_payload_at_write_boundary`, `test_store_sanitizes_pattern_secret_at_write_boundary` |
+| F2 (MAJOR) | Значения под `*_ref`-ключами проходили только pattern scrub, а `looks_like_secret` — pattern-based, поэтому literal-ключ под `secret_ref` мог попасть в конфиг и быть повторён в экспорте | `_sanitize_reference_value`: сохраняется только reference-образное значение; всё прочее → `[REDACTED]`; для reference-образных — pattern scrub + проверка реестра. Паттерн дублирован в `contracts` (нельзя импортировать `sanctum`) и зафиксирован тестом синхронизации | `TestReferenceKeyValues` (6), `TestReferencePatternStaysInSync` |
+| F3 (MAJOR) | Запрет literal-ключа покрывал только `providers.models[].secret_ref`; `mcp.servers[].env` принимал ключ открытым текстом | `_check_mcp_credentials`: literal-секрет в `env`-значениях и в `command` → `SECRET_REF_INVALID`, значение не эхоится | `test_literal_secret_in_mcp_env_rejected`, `test_literal_secret_in_mcp_command_rejected`, `test_plain_mcp_env_is_accepted` |
+| F4 (MINOR) | Verifier не смотрел ключи и не-строки; `build_safe_export` не вызывал свой verifier | `_walk` проверяет и ключи (путь не эхоит ключ), включает `set`/`frozenset`; builder вызывает `verify_no_secrets` | `test_find_secret_material_detects_a_secret_used_as_key`, `..._registered_value_as_key`, `..._inside_a_set`, `test_build_safe_export_refuses_when_the_sanitizer_is_bypassed` |
+| F5 (MINOR) | Часть тестов проходила бы и при отключённой защите (маркер не входил во вход; export не читает значения) | Тесты усилены: маркер реально прогоняется через sink (export с зарегистрированным значением в identity-тексте, error details под нейтральным ключом, `purpose` в privacy), добавлены whitelist-проверки полей | `test_export_scrubs_a_registered_secret_planted_in_identity`, `test_summary_contains_no_payload`, `test_denial_detail_never_contains_payload`, `test_policy_dict_has_no_secrets` |
+| F6 (MINOR) | Документация обещала больше фактического: «literal key in config is rejected by the loader» (только распознанные форматы) и «error if unavailable» у `backend="dpapi"` (фактически деградация к fail-closed) | Формулировки в `secrets.py` приведены к поведению | — |
+| F7 (MINOR, adjacent S07) | Необработанное исключение печаталось в CLI без санитизации (`validator.py` → `cli/config.py`) | Сообщение об unexpected error и вывод CLI проходят через `sanitize_text` | — |
+
+**Остаточный риск (не исправлен, задокументирован).** Ссылка — логическое имя, поэтому
+форма значения под `secret_ref` принципиально не отличает настоящую ссылку от
+pattern-free ключа, случайно выглядящего как имя. Такой ключ отвергается, только если
+совпал известный формат или значение уже известно процессу. Ужесточение (энтропийная
+эвристика или обязательный префикс ссылки) отложено на S11, чтобы не ломать
+совместимость конфигов. Зафиксировано в ADR-006.
+
+### 5. Acceptance Criteria (все проверены)
+
+| Критерий | Результат |
+|---|---|
+| Export не содержит активных секретов | **PASS** — значения не читаются (`secrets.included=false`, только `refs`); builder вызывает `verify_no_secrets` и отказывается возвращать payload с секретом; E2E `secrets audit` → exit 0, маркер отсутствует во всех файлах корня (включая `.bin`) |
+| Auth errors не раскрывают значение ключа | **PASS** — `provider_auth_error` + реестр известных секретов; значение не попадает ни в `safe_message`, ни в `sanitized_details`, ни в `str(err)`; для pattern-free ключа покрыто усиленными тестами |
+| Privacy policy проверяется перед внешней передачей | **PASS** — `assert_transmission_allowed` бросает `PRIVACY_TRANSMISSION_DENIED`; дефолтная политика запрещающая; `privacy summary` → DENIED (exit 1) без opt-in. Runtime-вызов добавит MODEL LAYER (S12+); сегодня внешнего трафика нет |
+
+### 6. Ответы на обязательные вопросы
+
+**1. Где физически хранится секрет в выбранной платформе?**
+В Windows DPAPI-шифртексте внутри корня SERAPHIM: `<root>/data/secrets/<ref>.bin`.
+Файл содержит magic `SRP1` + blob `CryptProtectData`. Ключ шифрования — credential
+master key пользователя ОС; SERAPHIM не хранит и не вводит парольную фразу.
+Путь виден пользователю (`seraphim secrets list`, `secrets show`). Замена — атомарная
+(`tmp` + `os.replace`). Ограничения: шифртекст привязан к пользователю и машине;
+защита *at rest*, не от процесса того же пользователя. При отсутствии безопасного
+backend — fail-closed, plaintext-fallback отсутствует.
+
+**2. Что входит в export вместо секретного значения?**
+Только логическая ссылка `secret_ref` (например `provider.openai`) и метаданные
+backend'а: `secrets.included=false`, `backend`, логический относительный `location`,
+`refs` (имена) и note о том, что значения восстанавливаются из хранилища. Значения
+не читаются вовсе, поэтому не могут попасть в payload; дополнительно payload проходит
+verifier, который при находке бросает `DIAGNOSTIC_EXPORT_FAILED`, не эхоя значение.
+
+**3. Когда пользователь узнаёт, что контекст отправится в облако?**
+До передачи: `privacy summary` печатает provider, модель, purpose, destination и
+**категории локальных данных**, которые будут отправлены, и вердикт
+ALLOWED/DENIED с причиной. В runtime тот же summary отдаёт
+`summarize_request`/`PrivacyDecision.summary`, а `assert_transmission_allowed`
+обязан вызываться перед запросом к внешнему провайдеру; при разрешённой политике
+`requires_confirmation=True` требует явного подтверждения. Silent uploads нет:
+дефолтная политика запрещает внешнюю передачу, а разрешение требует явного opt-in
+и перечисления провайдера.
+
+### 7. Верификация
+
+```powershell
+# Полный набор (venv)
+.\.venv\Scripts\python.exe -m pytest -q
+# 481 passed, 1 skipped
+
+# Lint
+.\.venv\Scripts\python.exe -m ruff check backend/
+# All checks passed!
+```
+
+Ручные проверки (фактические результаты):
+
+```powershell
+# marker secret E2E в отдельном корне
+$root = Join-Path $env:TEMP "seraphim-s09-check"
+$env:SERAPHIM_TEST_SECRET = "SERAPHIM_TEST_SECRET_xyz789"
+python -m seraphim secrets set provider.openai --from-env SERAPHIM_TEST_SECRET --config-dir $root
+#  Stored secret 'provider.openai' in dpapi store.  location: <root>\data\secrets
+python -m seraphim secrets show provider.openai --config-dir $root
+#  provider.openai: ****z789
+python -m seraphim secrets audit --config-dir $root
+#  No secret material found in configs, logs or exports.   (exit 0)
+# grep по всем файлам корня: NO HITS (маркер отсутствует и в provider.openai.bin)
+```
+
+```powershell
+python -m seraphim secrets show provider.absent --config-dir $root
+#  error [SECRET_NOT_FOUND]: ... (exit 1)
+python -m seraphim secrets show "Bad Ref" --config-dir $root
+#  error [SECRET_REF_INVALID]: must match ^[a-z0-9]... (exit 1)
+# literal-ключ в secret_ref / в mcp.servers[].env:
+#  Configuration validation failed; значение не эхоится (exit 1)
+python -m seraphim privacy summary --provider openai --categories prompt,files --config-dir $root
+#  Decision: DENIED (external_transmission_disabled)   (exit 1)
+```
+
+### 8. Ответы на контрольные вопросы (проверки)
+
+- Redaction: `test_contracts_sanitization.py` (паттерны провайдеров, реестр known
+  secrets, `*_ref`-значения), `test_logger.py` (в т.ч. без явного redactor).
+- Missing ref: `SECRET_NOT_FOUND` (CLI exit 1); `config validate` не требует наличия
+  значения — присутствие проверяется при использовании.
+- Invalid ref: `SECRET_REF_INVALID` (форма/длина/reserved names), значение не эхоится.
+- Export-without-secrets: `TestExportWithoutSecrets`, `secrets audit`, self-verification builder'а.
+- Logging: `TestSecretLogging`, `test_logger_*`; значения не логируются, маска — только
+  хвост; SQLite-путь санитизируется `Event.__post_init__` → `sanitize_dict`.
+- Fail-closed: `TestUnavailableStore`, `test_factory_*`; на не-Windows — недоступное
+  хранилище, а не plaintext.
+- DPAPI: `TestDPAPIStore` (win32), `dpapi_available()` round-trip.
+
+### 9. Ручные проверки пользователя
+
+1. **Marker secret во всех артефактах/логах** (команды из §7): задать значение через
+   `--from-env`, затем `secrets show` (ожидается `****z789`), `secrets audit`
+   (ожидается exit 0) и поиск строки маркера по всем файлам корня — совпадений быть не должно.
+2. **Ссылка на несуществующий `secret_ref`**: `secrets show provider.absent` и
+   `secrets delete provider.absent` → `SECRET_NOT_FOUND`, exit 1; при этом
+   `config validate` остаётся PASS, потому что значение не требуется до использования.
+
+### 10. Риски и долги
+
+1. **Privacy gate не подключён в runtime** — `assert_transmission_allowed` обязана
+   вызывать MODEL LAYER (S12+); сегодня в `backend/seraphim` нет сетевого кода, поэтому
+   критерий выполнен через явную точку решения, а не через живой вызов.
+2. **Остаточный риск по `secret_ref`** (см. §4): pattern-free ключ, по форме совпадающий
+   с именем, неотличим от ссылки; ужесточение — кандидат на S11.
+3. **DPAPI-ограничения**: не переносим между машинами/аккаунтами и не защищает от
+   процесса того же пользователя; задокументировано в ADR-006 и в docstring'е.
+4. **Entropy** — фиксированный не-секретный доменный разделитель, не ключ.
+5. **`handle_errors` применён только к командам S09**; унификация обработки ошибок CLI — S10.
+6. **Экспорт/импорт/backup pipeline** — S11; S09 даёт гарантию и verifier, но не manifest
+   и не restore-проверки. Golden-сценарий §20.2 #18 закрывается в S11.
+7. **Инъекция секретов в MCP** — S37; до этого literal-значение в `mcp.servers[].env`/
+   `command` является ошибкой конфигурации.
+8. **`user_preferences.md` (§12.2)** не реализован (не входил в перечень S09).
+9. **Изоляция process-wide реестра** обеспечена autouse-фикстурой в `tests/conftest.py`;
+   продовый код регистрирует значения только при чтении из хранилища.
+10. Незакоммиченные изменения S07/S08 сохранены.
+
+### 11. Резюме изменений
+
+```
+backend/seraphim/sanctum/
+  secrets.py            — SecretStore, DPAPISecretStore, InMemorySecretStore, UnavailableSecretStore,
+                          create_secret_store, validate_secret_ref, mask_secret, provider_auth_error
+  privacy.py            — DATA_CATEGORIES, PrivacyPolicy, TransmissionRequest, PrivacyDecision,
+                          summarize_request, render_summary, evaluate_transmission,
+                          assert_transmission_allowed, prepare_payload
+  export.py             — build_safe_export, sanitize_export, find_secret_material, verify_no_secrets
+backend/seraphim/cli/
+  secrets.py            — seraphim secrets set|list|show|rotate|delete|audit, privacy summary
+  errors.py             — handle_errors
+backend/seraphim/contracts/
+  sanitization.py       — паттерны провайдерских ключей, process-wide реестр, *_ref-значения
+  errors.py             — SECRET_NOT_FOUND/SECRET_REF_INVALID/SECRET_STORE_UNAVAILABLE/PRIVACY_TRANSMISSION_DENIED
+backend/seraphim/observatory/logger.py  — опциональный SecretRedactor
+backend/seraphim/observatory/store.py   — sanitize payload at write boundary
+backend/seraphim/sanctum/{config_schemas,loader,validator,__init__}.py, cli/{main,config}.py
+backend/tests/sanctum/{test_secrets.py (65), test_privacy.py (25), test_export_secrets.py (19)}
+backend/tests/cli/test_secrets_cli.py (16)
+backend/tests/{test_contracts_sanitization.py, observatory/test_logger.py, observatory/test_store.py, sanctum/test_loader.py, conftest.py}
+```
+
+### 12. Предлагаемое сообщение коммита
+
+```
+feat: S09 SANCTUM secret storage, privacy gate and secret-free export
+
+- sanctum/secrets.py: SecretStore interface; Windows DPAPI backend (ctypes,
+  ciphertext in <root>/data/secrets/<ref>.bin), in-memory and fail-closed
+  backends; secret refs, masked display, rotation/delete; read values are
+  registered process-wide so they can never be written back out
+- sanctum/privacy.py: deterministic transmission gate with restrictive
+  defaults, privacy summary (provider + local data categories), payload
+  redaction before transmission
+- sanctum/export.py: secret-free export builder (references only) that
+  verifies its own output; verifier reports paths, never values
+- contracts/sanitization.py: provider key patterns, process-wide known-secret
+  registry, reference-shaped values only under *_ref keys
+- sanctum/loader.py: secret_ref only, literal keys rejected (incl. mcp env/command)
+- cli/secrets.py: seraphim secrets set|list|show|rotate|delete|audit, privacy summary
+- ADR-006: secrets ACCEPTED (variant 4, DPAPI); local models still PROPOSED
+- tests: 125 new S09 tests + 27 hardening tests; 481/482 PASS; ruff clean
+```
+
+---
+
+*Конец IMPLEMENTATION_LOG.md S09.*

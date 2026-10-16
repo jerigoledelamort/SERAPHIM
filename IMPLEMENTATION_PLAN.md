@@ -126,14 +126,17 @@
 
 ### Блок D. SANCTUM и CLI
 
-**S07 — SANCTUM: загрузчик конфигурации** · Гейт: C2
+**S07 — SANCTUM: загрузчик конфигурации** · ВЫПОЛНЕН · Гейт: C2
 - Критерии завершения: конфигурация валидируется через одну точку входа · ошибки указывают файл/ключ и способ исправления · CLI и GUI смогут использовать тот же validator.
+- Факт: `backend/seraphim/sanctum/{loader.py, validator.py, schemas/}`, `backend/seraphim/cli/{config.py, main.py}`, `backend/seraphim/__main__.py`, CLI command `seraphim config validate`, 281/282 tests PASS (18 new sanctum tests), ruff PASS.
 
-**S08 — SANCTUM: identity и сборка инструкций**
+**S08 — SANCTUM: identity и сборка инструкций** · ВЫПОЛНЕН
 - Критерии завершения: активные инструкции можно инспектировать без раскрытия секретов · данные из Skill/файла не могут повыситься до system policy · пустые identity files имеют предсказуемые defaults.
+- Факт: `backend/seraphim/sanctum/{identity.py, prompt_composer.py}`, `backend/seraphim/cli/identity.py`, шаблон `identity/{identity.yaml, system_prompt.md, personality.md, response_style.md}`, `seraphim identity show|prompt-preview`, 42 new tests (12 identity + 22 composer + 5 snapshot + 3 CLI, 323/324 PASS), ruff PASS. Независимый review (code-reviewer, 2 раунда) — 2 BLOCKER закрыты (циклическая нейтрализация `<<<` с доказанным завершением; метка `source` сводится к безопасному токену — закрыт и `>>>`/`key=value` spoofing), 3 MINOR закрыты, остальные MINOR оставлены осознанно и задокументированы.
 
-**S09 — SANCTUM: секреты, privacy и redaction** · Гейт: ADR-006
+**S09 — SANCTUM: секреты, privacy и redaction** · ВЫПОЛНЕН · Гейт: ADR-006 (секреты — ACCEPTED)
 - Критерии завершения: export не содержит активных секретов · auth errors не раскрывают значение ключа · privacy policy проверяется перед внешней передачей данных.
+- Факт: `backend/seraphim/sanctum/{secrets.py, privacy.py, export.py}`, `backend/seraphim/cli/{secrets.py, errors.py}`, CLI `seraphim secrets set|list|show|rotate|delete|audit` и `seraphim privacy summary`, 125 new tests в четырёх S09-файлах (65 secrets + 25 privacy + 19 export + 16 CLI) плюс +18 в `test_contracts_sanitization.py`/`test_logger.py`/`test_store.py`/`test_loader.py`, 481/482 PASS, ruff PASS. Секреты — только в платформенном хранилище: ADR-006 переведён в ACCEPTED для секретов (вариант 4 — Windows DPAPI через `ctypes`, шифртекст в `<root>/data/secrets/<ref>.bin`, ноль новых зависимостей); при отсутствии безопасного backend — fail-closed (`SECRET_STORE_UNAVAILABLE`), plaintext-fallback отсутствует. В конфиге только `secret_ref`; literal-ключ отвергается (`SECRET_REF_INVALID`), включая `mcp.servers[].env`/`command`. Значение, прочитанное процессом, регистрируется process-wide и удаляется из любого sink'а (ошибки, логи, события/SQLite, экспорт) точным совпадением. Privacy gate по умолчанию запрещающий (`allow_external_transmission=false`). Независимый security-review (read-only): 0 BLOCKER, 3 MAJOR и 4 MINOR — все MAJOR и MINOR закрыты, остаточный риск (энтропийная эвристика для `secret_ref`) задокументирован; подробности — `IMPLEMENTATION_LOG.md`.
 
 **C3 — CHECKPOINT: SANCTUM config, identity, privacy**
 

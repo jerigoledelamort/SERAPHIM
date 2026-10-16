@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import StrEnum
 from typing import Any
 
 from seraphim.contracts.constants import RISK_LEVELS, SIDE_EFFECTS
@@ -15,14 +15,14 @@ from seraphim.contracts.errors import ErrorCode, SeraphimError
 _CAPABILITY_ID_RE = re.compile(r"^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*){1,2}$")
 
 
-class RiskLevel(str, Enum):
+class RiskLevel(StrEnum):
     LOW = "low"
     MEDIUM = "medium"
     HIGH = "high"
     CRITICAL = "critical"
 
 
-class SideEffect(str, Enum):
+class SideEffect(StrEnum):
     NONE = "none"
     READ = "read"
     WRITE = "write"

@@ -41,6 +41,23 @@ def _never_touch_user_database(tmp_path_factory: pytest.TempPathFactory) -> Iter
         )
 
 
+@pytest.fixture(autouse=True)
+def _isolated_known_secrets() -> Iterator[None]:
+    """Clear the process-wide known-secret registry around every test.
+
+    The secret store registers every value it reads so that the value can never
+    be written back to a log, error or export (S09).  That registry is
+    process-wide state, so tests must not leak it into one another.
+    """
+    from seraphim.contracts.sanitization import clear_known_secrets
+
+    clear_known_secrets()
+    try:
+        yield
+    finally:
+        clear_known_secrets()
+
+
 @pytest.fixture
 def test_root(tmp_path: Path) -> Path:
     """A throwaway SERAPHIM root (never user data)."""

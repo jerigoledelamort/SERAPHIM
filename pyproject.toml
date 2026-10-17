@@ -50,8 +50,13 @@ skip-magic-trailing-comma = false
 line-ending = "lf"
 
 # --- setuptools package discovery --------------------------------------------
-# Explicitly limit to backend/ to avoid "multiple top-level packages" error.
+# The package lives under backend/, so package discovery must start there.
+# Without ``where`` setuptools searches the project root, finds no ``seraphim``
+# package, and the editable install maps nothing (``import seraphim`` fails and
+# the ``seraphim`` console script cannot start).  Tests are unaffected because
+# pytest adds ``backend`` via ``pythonpath``.
 [tool.setuptools.packages.find]
+where = ["backend"]
 include = ["seraphim*"]
 namespaces = false
 

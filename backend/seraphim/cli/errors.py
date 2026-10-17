@@ -5,9 +5,9 @@ so the user sees the stable error code and the safe message instead of a
 traceback.  The error text is the sanitized ``safe_message``, so a secret can
 never be printed here.
 
-Scope note: only the S09 commands are wrapped for now; the S07/S08 commands
-still let errors propagate.  A uniform CLI error surface belongs to S10
-(CLI foundation and doctor).
+Scope note: every CLI command that can raise a ``SeraphimError`` is wrapped, so
+no command surfaces a raw traceback (the S07/S08 identity and config commands
+were wrapped as part of the C4 review follow-up, closing the S10 debt).
 """
 
 from __future__ import annotations

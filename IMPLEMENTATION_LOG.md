@@ -1835,7 +1835,7 @@ python -m seraphim privacy summary --provider openai --categories prompt,files -
 3. **DPAPI-ограничения**: не переносим между машинами/аккаунтами и не защищает от
    процесса того же пользователя; задокументировано в ADR-006 и в docstring'е.
 4. **Entropy** — фиксированный не-секретный доменный разделитель, не ключ.
-5. **`handle_errors` применён только к командам S09**; унификация обработки ошибок CLI — S10.
+5. **`handle_errors` применён к командам S09 и S10**; унификация CLI-ошибок закрыта.
 6. **Экспорт/импорт/backup pipeline** — S11; S09 даёт гарантию и verifier, но не manifest
    и не restore-проверки. Golden-сценарий §20.2 #18 закрывается в S11.
 7. **Инъекция секретов в MCP** — S37; до этого literal-значение в `mcp.servers[].env`/
@@ -1893,4 +1893,368 @@ feat: S09 SANCTUM secret storage, privacy gate and secret-free export
 
 ---
 
-*Конец IMPLEMENTATION_LOG.md S09.*
+## S10 — CLI foundation и doctor
+
+### 1. Цель и объём
+
+Ранняя CLI для управления и диагностики: `seraphim --help`, `doctor`, `status`,
+`config show`, `config validate`, `logs tail` — с понятными exit codes и
+machine-readable (`--json`) выводом. CLI — тонкая обёртка над service API
+(OBSERVATORY/SANCTUM/storage); бизнес-логика не дублируется, тот же код позже
+вызовет GUI. Диагностика read-only: не создаёт БД, не пишет файлы, не запускает
+destructive fixes, не печатает секреты.
+
+### 2. Компоненты
+
+- `observatory/doctor.py` — service `run_doctor()` (9 checks) и `build_status()`.
+  Каждый check возвращает `DoctorCheck(id,title,severity,summary,remediation,details)`;
+  severity ∈ {ok, warn, error}. Ошибки делают `report.healthy=False`.
+- `observatory/logs.py` — `read_log_tail(root, lines, name)`: выбор самого
+  свежего файла из `logs/` (или по имени), чтение хвоста, пропуск symlink'ов,
+  санитизация каждой строки через contracts sanitization.
+- `cli/doctor.py` — `seraphim doctor [--config-dir] [--json]`. Human: `[PASS]/[WARN]/[FAIL]`
+  + remediation; JSON: `{healthy, root, checks[]}`. Exit 0 healthy / 1 errors.
+- `cli/status.py` — `seraphim status [--config-dir] [--json]`. Компактный snapshot.
+- `cli/logs.py` — `seraphim logs tail [--config-dir] [--lines N] [--file NAME] [--json]`.
+  `--lines<0` → exit 1; отсутствующий `--file` → exit 1; нет логов → exit 0.
+- `cli/config.py` — добавлены `config show` (human + JSON, 8 доменов) и
+  `config validate --json`.
+- `cli/main.py`, `cli/__init__.py` — регистрация/экспорт команд.
+- `contracts/errors.py` — `handle_errors` унифицирует поверхность ошибок CLI
+  (закрыт долг S09 §10.5).
+- `pyproject.toml` — исправлен `tool.setuptools.packages.find where=["backend"]`,
+  благодаря чему `python -m seraphim` работает без ручного `PYTHONPATH`.
+
+### 3. Проверки doctor (error vs warning)
+
+- `root` — **error**, если путь не существует или не директория.
+- `root_layout` — **warning** при отсутствии стандартных каталогов (identity/data/logs);
+  создаются при первом запуске.
+- `permissions` — **error** при отсутствии read/write доступа к root.
+- `config` — **error** при синтаксических/schema-проблемах конфигурации.
+- `database` — **warning**, если БД ещё не инициализирована; **error**, если файл
+  есть, но не инициализирован / out-of-sync / schema новее текущей.
+- `secret_store` — **warning**, если безопасный backend недоступен (не-Windows);
+  **pass**, если DPAPI готов.
+- `identity` — **error** при невалидной идентичности.
+- `prerequisites` — **error** при неподходящей версии Python или отсутствующих модулях.
+- `local_api` — **warning** (loopback API появится с VESSEL, S50).
+
+### 4. Безопасность секретов
+
+Human- и JSON-вывод doctor/status/config/logs не печатают секретный материал.
+Секреты не читаются вовсе (doctor обращается к secret store только за метаданными
+backend'а и числом ссылок). Строки логов проходят `sanitize` (паттерны провайдеров +
+process-wide реестр + `*_ref`). В smoke-тесте `secret=sk-... password=...` →
+`[REDACTED] [REDACTED]`.
+
+### 5. Machine-readable (CI)
+
+Все команды поддерживают `--json`: `doctor --json` → `{healthy,root,checks[]}`
+(поля check'а: `id,title,severity,summary,remediation,details`); `status --json`;
+`config validate --json` → `{valid,issues[]}`; `config show --json` → 8 доменов;
+`logs tail --json`. В CI достаточно парсить JSON и exit code — без разбора цветного
+human-вывода.
+
+### 6. Верификация
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest -q        # 517 passed, 1 skipped
+.\.venv\Scripts\python.exe -m ruff check backend/   # All checks passed!
+```
+
+Тесты S10 (52 в `tests/cli/`): doctor 10, status 7, logs 8, config 8, плюс
+существующие identity/secrets CLI. Покрыты exit codes, healthy/broken, JSON,
+redaction, read-only (БД не создаётся), неверные аргументы (exit 2), секретная
+безопасность.
+
+Smoke (фактические результаты, изолированный root в %TEMP%):
+
+```powershell
+python -m seraphim doctor --config-dir <healthy>   # exit 0, 3 warnings, DB_CREATED=False
+python -m seraphim doctor --config-dir <broken>    # exit 1, [FAIL] Configuration, remediation
+python -m seraphim doctor --config-dir <healthy> --json  # healthy=true; 9 check-id; поля id/title/severity/summary/remediation/details
+python -m seraphim status --config-dir <healthy>   # exit 0, Overall: HEALTHY
+python -m seraphim config validate --config-dir <healthy> --json  # {"valid": true,"issues": []}
+python -m seraphim logs tail --config-dir <healthy>  # secret/password -> [REDACTED], no leak
+```
+
+### 7. Ответы на контрольные вопросы
+
+- **Error vs warning** — см. §3. Блокируют (exit 1): root, permissions, config,
+  database-ошибки, identity, prerequisites. Только предупреждают (exit 0):
+  root_layout, database-not-initialized, secret_store-unavailable, local_api.
+- **CI без парсинга цвета** — `--json` + exit code (§5).
+- **Общая логика с GUI** — GUI вызовет те же `run_doctor()`, `build_status()`,
+  `read_log_tail()`, `load_config()`, `validate_config_files()`. CLI не содержит
+  бизнес-логики.
+
+### 8. Ручные проверки пользователя
+
+1. `seraphim doctor` в healthy корне → exit 0, понятные warnings; в намеренно
+   сломанном (битый `config/runtime.yaml`) → exit 1, `[FAIL] Configuration`.
+2. `seraphim doctor --json` → валидный JSON с `healthy` и `checks[]`.
+3. Убедиться, что после `doctor`/`status` файл `data/seraphim.sqlite` не создан.
+4. Убедиться, что секреты (значения, не `secret_ref`) не встречаются в выводах.
+
+### 9. Риски и долги
+
+1. **Local API check — заглушка** (warning до S50/VESSEL): реальная проверка
+   loopback-порта появится вместе с API.
+2. **Python-version gate в CI**: глобальный интерпретатор 3.10.10 < `requires-python>=3.11`;
+   venv использует 3.14.2. Для CI нужен явный 3.11+ (не блокирует локальную работу).
+3. **`ruff format` не является gate проекта** (предсуществующие файлы не format-clean,
+   `line-length=99`, E501 игнорируется); обязательна только `ruff check`.
+4. **DPAPI-only secret store**: на не-Windows doctor даёт warning (fail-closed в S09).
+5. Незакоммиченные изменения S07/S08/S09 сохранены; S10 не коммитит (по инструкции).
+
+### 10. Резюме изменений
+
+```
+backend/seraphim/observatory/
+  doctor.py  — run_doctor(), build_status(), DoctorCheck/DoctorReport (9 read-only checks)
+  logs.py    — read_log_tail() (freshest/ named file, symlink skip, sanitize)
+backend/seraphim/cli/
+  doctor.py  — seraphim doctor [--config-dir] [--json]
+  status.py  — seraphim status [--config-dir] [--json]
+  logs.py    — seraphim logs tail [--config-dir] [--lines] [--file] [--json]
+  config.py  — + config show, + config validate --json
+  main.py / __init__.py — регистрация и экспорт команд
+backend/seraphim/contracts/errors.py — handle_errors (унификация CLI-ошибок)
+pyproject.toml — packages.find where=["backend"] (python -m seraphim без PYTHONPATH)
+backend/tests/cli/ — conftest + 52 CLI-теста (doctor/status/logs/config)
+```
+
+### 11. Предлагаемое сообщение коммита
+
+```
+feat: S10 CLI foundation and read-only doctor/status/logs
+
+- observatory/doctor.py: run_doctor() 9 read-only checks + build_status();
+  PASS/WARN/FAIL with remediation, healthy verdict, no state changes
+- observatory/logs.py: read_log_tail() with symlink skip and secret redaction
+- cli: seraphim doctor|status|logs tail|config show|config validate with
+  human + --json machine-readable output and clear exit codes
+- cli/errors.handle_errors unifies CLI error surface (closes S09 debt)
+- pyproject: packages.find where=["backend"] so python -m seraphim works
+- tests: 52 CLI tests (exit codes, healthy/broken, JSON, redaction, read-only);
+  517/518 PASS, ruff check clean
+```
+
+---
+
+*Конец IMPLEMENTATION_LOG.md S10.*
+
+---
+
+## S11 — Экспорт, импорт и конфигурационный backup
+
+### 1. Цель и объём
+
+Переносимая резервная копия конфигурации без секретов: `seraphim config export`
+создаёт zip-архив с manifest, версиями, checksums и списком исключений;
+`seraphim config import` валидирует, показывает dry-run diff, делает backup
+текущего, применяет атомарно с rollback при ошибке.
+
+### 2. Что входит в архив и что намеренно исключено
+
+**Включено:** config (8 YAML-доменов), identity (identity.yaml, system_prompt.md,
+personality.md, response_style.md), locale (locales/*), theme (themes/*), skills
+(skills/*).
+
+**Исключено:** секретные значения (только `secret_ref`), БД (data/seraphim.sqlite),
+секретные blob'ы (data/secrets/), логи, артефакты, память, кэш.
+
+Manifest содержит: `export_format_version`, `seraphim_version`, `created_at`,
+`checksums` (sha256 каждого файла), `domains`, `excluded`, `file_count`.
+
+### 3. Как пользователь увидит diff перед применением
+
+`seraphim config import <archive>` по умолчанию выполняет **dry-run**:
+- читает manifest, проверяет version и checksums;
+- сравнивает файлы архива с существующими в target root;
+- печатает: `+ added`, `~ modified`, `- removed`, `unchanged`;
+- НЕ записывает ничего.
+
+Для реального применения: `seraphim config import <archive> --apply`.
+
+### 4. Как восстанавливается конфигурация при частичной ошибке
+
+1. Перед применением создаётся backup: `data/backups/pre-import-backup-<timestamp>/`
+   (копия всех доменов текущего root).
+2. Файлы пишутся атомарно per-file (temp + `os.replace`).
+3. Если запись прерывается (traversal, I/O error):
+   - вызывается `_restore_backup()` — `shutil.rmtree` целевого каталога + `shutil.copytree`
+     из backup;
+   - исходный импорт бросает `ARCHIVE_IMPORT_FAILED`;
+   - если и rollback не удался — `ARCHIVE_ROLLBACK_FAILED` с указанием пути backup'а
+     для ручного восстановления.
+
+### 5. Защита от path traversal
+
+Каждый путь внутри архива нормализуется (`PurePosixPath`), разрешается относительно
+target root и проверяется через `.relative_to(target_root)`. `../` → `ARCHIVE_PATH_TRAVERSAL`
+(exit 1), файл не записывается.
+
+### 6. Компоненты
+
+- `sanctum/export_import.py` — service layer: `export_to_archive()`,
+  `import_from_archive()` (dry_run, apply, rollback), `_check_traversal()`.
+- `cli/config.py` — команды `config export` и `config import` (human + `--json`).
+- `contracts/errors.py` — ARCHIVE_EXPORT_FAILED, ARCHIVE_VERSION_INCOMPATIBLE,
+  ARCHIVE_PATH_TRAVERSAL, ARCHIVE_ROLLBACK_FAILED, ARCHIVE_INTEGRITY_FAILED.
+- `sanctum/export.py` — переиспользуется `build_safe_export`, `verify_no_secrets`.
+
+### 7. Верификация
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest -q          # 541 passed, 1 skipped (2.78s)
+.\.venv\Scripts\python.exe -m ruff check backend/  # All checks passed!
+```
+
+24 новых теста S11:
+- TestExportHappy (5): zip+manifest, expected files, secret exclusion, data dirs excluded, custom path
+- TestImportDryRun (2): diff shows additions, unchanged
+- TestImportApply (2): writes files, creates backup
+- TestVersionMismatch (1): incompatible version rejected
+- TestPathTraversal (2): archive `../` rejected, helper unit
+- TestSecretExclusion (2): archive has no secret bytes, refs not values
+- TestRollback (2): partial failure → rollback restores original, backup has pre-import state
+- TestArchiveNotFound (1): missing archive rejected
+- TestExportCLI (3): exit 0, JSON, custom path
+- TestImportCLI (4): dry-run, JSON, apply, missing archive
+
+### 8. Ответы на контрольные вопросы
+
+**Что входит в архив и что намеренно исключено?**
+Включены: config (8 доменов YAML), identity (4 файла), locales, themes, skills.
+Исключены: секретные значения, БД, логи, артефакты, память, кэш.
+
+**Как пользователь увидит diff перед применением?**
+`seraphim config import <archive>` (без `--apply`) показывает dry-run diff:
+`+ added`, `~ modified`, `- removed`, `unchanged`. Ничего не записывается.
+
+**Как восстанавливается конфигурация при частичной ошибке?**
+Перед применением создаётся backup. При ошибке записи — автоматический rollback
+из backup. Если rollback не удался — `ARCHIVE_ROLLBACK_FAILED` с указанием пути
+для ручного восстановления.
+
+### 9. Ручные проверки пользователя
+
+1. **Экспорт в тестовый root:** `seraphim config export --config-dir <test-root>`
+   → zip + json в `data/backups/`.
+2. **Импорт в чистый root (dry-run):** `seraphim config import <zip> --config-dir <temp-root>`
+   → показывает `+ config/runtime.yaml`, `+ identity/...`, `(Dry-run)`.
+3. **Импорт (apply):** `seraphim config import <zip> --config-dir <temp-root> --apply`
+   → файлы записаны, backup создан.
+4. **Path traversal:** архив с `../escape.txt` → `Import failed: ...path traversal detected`, exit 1.
+5. **Секреты:** экспортированный zip не содержит строк `sk-ant`, `sk-` и известных значений.
+
+### 10. Риски и долги
+
+1. **Skills/locales/themes** — в S11 экспортируются как файлы; полноценная валидация
+   Skills (manifest schema) — S36.
+2. **Secret refs после импорта** — значения не экспортируются; если secret store
+   перемещён, пользователь должен заново задать значения через `seraphim secrets set`.
+3. **Конфликт при импорте в существующий root** — dry-run показывает modified/removed,
+   но merge-стратегии нет; импорт перезаписывает. Это ожидаемо для config backup.
+4. **Full-state backup** (БД, memory, checkpoints) — S74; S11 — config-only.
+5. Незакоммиченные изменения S07–S10 сохранены; S11 не коммитит.
+
+### 11. Резюме изменений
+
+```
+backend/seraphim/sanctum/export_import.py  — export_to_archive(), import_from_archive(),
+                                               _check_traversal(), _atomic_apply(), _restore_backup()
+backend/seraphim/cli/config.py             — +config export, +config import (human + --json)
+backend/seraphim/contracts/errors.py       — ARCHIVE_EXPORT_FAILED, ARCHIVE_VERSION_INCOMPATIBLE,
+                                              ARCHIVE_PATH_TRAVERSAL, ARCHIVE_ROLLBACK_FAILED,
+                                              ARCHIVE_INTEGRITY_FAILED
+backend/tests/sanctum/test_export_import.py — 24 теста (export, import, dry-run, apply,
+                                               traversal, version mismatch, rollback, secrets)
+```
+
+### 12. Предлагаемое сообщение коммита
+
+```
+feat: S11 config export/import with dry-run, backup and rollback
+
+- sanctum/export_import.py: export_to_archive() produces a zip with manifest
+  (format_version, sha256 checksums, domains, excluded); import_from_archive()
+  validates, shows dry-run diff, backs up, atomically applies, rolls back on failure
+- cli: seraphim config export|import with human + --json output and clear exit codes
+- contracts/errors: 5 new ARCHIVE_* error codes
+- path traversal guard: archive entries with ../ are rejected
+- secret exclusion: only secret_ref references in the archive, never values
+- tests: 24 new S11 tests (version mismatch, traversal, partial failure,
+  secret exclusion, rollback, CLI smoke); 541/542 PASS, ruff check clean
+```
+
+---
+
+*Конец IMPLEMENTATION_LOG.md S11.*
+
+---
+
+## C4 review follow-up — исправления дефектов экспорта/импорта и CLI
+
+Независимый review checkpoint C4 выявил 5 дефектов. Все исправлены; добавлены
+регрессионные тесты, которые до фикса падали.
+
+### FINDING-1 (MAJOR) — rollback не восстанавливал `locales`/`themes`
+`_restore_backup` итерировал ключи `DOMAIN_DIRS` (`locale`, `theme`), тогда как
+бэкап пишется по именам каталогов (`locales`, `themes`). Два домена молча
+пропускались, и после сбоя записи root оставался в смешанном состоянии.
+Исправлено: итерация по `DOMAIN_DIRS.values()`; домен, созданный импортом, но
+отсутствовавший в бэкапе, удаляется (полное восстановление pre-import-состояния).
+Тест `TestRollbackAllDomains::test_apply_failure_restores_locales_and_themes`
+форсирует сбой `os.replace` на последнем домене и проверяет восстановление всех
+пяти доменов.
+
+### FINDING-2 (MAJOR) — checksum'ы заявлялись, но не проверялись
+`import_from_archive` не сверял `sha256` из manifest с байтами архива, поэтому
+повреждённый/подменённый архив применялся молча. Добавлена `_verify_checksums`
+(после traversal-проверки, до diff): каждый файл обязан быть объявлен в manifest
+и совпадать по digest, иначе `ARCHIVE_INTEGRITY_FAILED` (значение не раскрывается).
+Тесты `TestIntegrity::test_tampered_checksum_rejected`,
+`test_undeclared_entry_rejected`.
+
+### FINDING-3 (MAJOR) — секретный материал в сырых locale/theme/skills
+`build_safe_export`/`verify_no_secrets` видят только структурированные config и
+identity. Сырые файлы доменов locale/theme/skills архивировались без проверки,
+поэтому ключ, вставленный в `.css`/`.json`/`.yaml`, попадал в архив. Каждый
+архивируемый файл теперь экранируется `_assert_secret_free`; при находке экспорт
+отказывается (`ARCHIVE_EXPORT_FAILED`), значение в сообщении не попадает.
+Тесты `TestRawSecretExclusion::test_export_refuses_secret_in_theme`,
+`test_export_refuses_secret_in_locale`.
+
+### FINDING-4 (MINOR) — dry-run обещал `- removed`, `--apply` не удалял
+`_atomic_apply` теперь принимает `remove` (список `removed` из diff) и удаляет
+файлы после записи, с той же traversal-защитой; сбой удаления вызывает rollback
+(бэкап хранит удалённые файлы). Тест `TestApplyRemovesFiles::test_apply_deletes_removed_file`.
+
+### FINDING-5 (MINOR) — `identity` CLI отдавал сырой traceback
+Команды `identity show`/`prompt-preview` не были обёрнуты в `handle_errors`,
+из-за чего невалидная identity печатала Python-traceback. Обе обёрнуты; докстринг
+`cli/errors.py` обновлён (долг S10 по унификации CLI-ошибок закрыт полностью).
+Тесты `test_identity_cli.py::test_identity_show_invalid_surfaces_error_code`,
+`test_identity_prompt_preview_invalid_surfaces_error_code`.
+
+### Верификация
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest -q            # 549 passed, 1 skipped
+.\.venv\Scripts\python.exe -m ruff check backend/  # All checks passed!
+```
+
+Добавлено 8 регрессионных тестов (6 export/import + 2 identity CLI). Code of
+conduct по секретам сохранён: сообщения об ошибках не раскрывают значения.
+
+### Замечание (вне объёма фиксов)
+В `backend/tests/cli/` тесты создают пустые каталоги `.seraphim/` и `config/`
+(команда doctor/сonfig с cwd по умолчанию). Git пустые каталоги не трекет, в
+коммит они не попадают. Устранить — отдельный долг изоляции тестов.
+
+---
+
+*Конец IMPLEMENTATION_LOG.md C4 review follow-up.*

@@ -140,11 +140,13 @@
 
 **C3 — CHECKPOINT: SANCTUM config, identity, privacy**
 
-**S10 — CLI foundation и doctor**
-- Критерии завершения: проблемы диагностики понятны без чтения кода · CLI поддерживает machine-readable сценарии · диагностика не меняет состояние без явной команды.
+**S10 — CLI foundation и doctor** · ВЫПОЛНЕН · Гейт: ADR-004 (CLI — ACCEPTED)
+- Критии завершения: проблемы диагностики понятны без чтения кода · CLI поддерживает machine-readable сценарии · диагностика не меняет состояние без явной команды.
+- Факт: `backend/seraphim/cli/{doctor.py,logs.py,status.py}`, `backend/seraphim/observatory/{doctor.py,logs.py}`, CLI `seraphim --help|doctor|status|config show|config validate|logs tail`, 40 новых тестов (10 doctor + 7 status + 8 logs + 8 config + conftest), 517/518 PASS, ruff check PASS. Doctor: 9 checks (root, root_layout, permissions, config, database, secret_store, identity, prerequisites, local_api) с явными PASS/WARN/FAIL и remediation; `--json` для CI; secrets redacted; БД не создаётся (read-only). Smoke: healthy root → exit 0, 3 warnings; broken root → exit 1, [FAIL] Configuration; log redaction подтверждена.
 
-**S11 — Экспорт, импорт и конфигурационный backup**
+**S11 — Экспорт, импорт и конфигурационный backup** · ВЫПОЛНЕН · Гейт: C4
 - Критерии завершения: импорт не может писать за пределы root · неудачный импорт сохраняет прежний конфиг · экспорт без секретов проходит validation и повторно импортируется.
+- Факт: `backend/seraphim/sanctum/export_import.py` (service layer: export_to_archive, import_from_archive), `backend/seraphim/cli/config.py` (+config export, +config import), error codes (ARCHIVE_EXPORT_FAILED, ARCHIVE_VERSION_INCOMPATIBLE, ARCHIVE_PATH_TRAVERSAL, ARCHIVE_ROLLBACK_FAILED, ARCHIVE_INTEGRITY_FAILED), 24 новых теста, 541/542 PASS, ruff PASS. Архив: zip с manifest.json (format_version, checksums, domains, excluded), config/identity/locale/theme/skills, секреты исключены. Импорт: dry-run diff → validate → staging → backup → atomic apply → rollback on failure. Path traversal: `../` → ARCHIVE_PATH_TRAVERSAL. Smoke: export → import dry-run → apply → files exist.
 
 **C4 — CHECKPOINT: CLI, doctor, backup**
 

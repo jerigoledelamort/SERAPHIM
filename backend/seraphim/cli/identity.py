@@ -11,6 +11,7 @@ from pathlib import Path
 
 import click
 
+from seraphim.cli.errors import handle_errors
 from seraphim.sanctum.identity import load_identity
 from seraphim.sanctum.prompt_composer import PromptComposer
 
@@ -30,6 +31,7 @@ def _resolve_root(config_dir: Path | None) -> Path:
     type=click.Path(exists=True, file_okay=False, dir_okay=True, path_type=Path),
     help="SERAPHIM root directory (defaults to current working directory)",
 )
+@handle_errors
 def show_command(config_dir: Path | None):
     """Show profile settings and the active instruction layers (no secrets)."""
     identity = load_identity(_resolve_root(config_dir))
@@ -64,6 +66,7 @@ def show_command(config_dir: Path | None):
     type=click.Path(exists=True, file_okay=False, dir_okay=True, path_type=Path),
     help="SERAPHIM root directory (defaults to current working directory)",
 )
+@handle_errors
 def prompt_preview_command(config_dir: Path | None):
     """Render the composed instruction prompt (secret-like values redacted)."""
     identity = load_identity(_resolve_root(config_dir))

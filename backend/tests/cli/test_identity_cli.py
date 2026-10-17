@@ -52,3 +52,30 @@ def test_identity_prompt_preview(tmp_path):
     assert result.exit_code == 0, result.output
     assert "<<<LAYER id=system_policy" in result.output
     assert "<<<LAYER id=personality" in result.output
+
+
+def test_identity_show_invalid_surfaces_error_code(tmp_path):
+    """A bad identity must produce a structured error, not a raw traceback."""
+    (tmp_path / "identity").mkdir(parents=True)
+    (tmp_path / "identity" / "identity.yaml").write_text(
+        "schema_version: 1\nprofile:\n  default_task_mode: not_a_real_mode\n",
+        encoding="utf-8",
+    )
+    result = CliRunner().invoke(identity_group, ["show", "--config-dir", str(tmp_path)])
+    assert result.exit_code == 1
+    assert "error [CONFIG_SCHEMA_INVALID]" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_identity_prompt_preview_invalid_surfaces_error_code(tmp_path):
+    (tmp_path / "identity").mkdir(parents=True)
+    (tmp_path / "identity" / "identity.yaml").write_text(
+        "schema_version: 1\nprofile:\n  default_task_mode: not_a_real_mode\n",
+        encoding="utf-8",
+    )
+    result = CliRunner().invoke(
+        identity_group, ["prompt-preview", "--config-dir", str(tmp_path)]
+    )
+    assert result.exit_code == 1
+    assert "error [CONFIG_SCHEMA_INVALID]" in result.output
+    assert "Traceback" not in result.output

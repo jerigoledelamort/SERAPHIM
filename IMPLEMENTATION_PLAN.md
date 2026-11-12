@@ -171,17 +171,26 @@
 
 ### Блок F. CORE / WINGS / AEGIS (ядро)
 
-**S16 — Task Engine: модель задачи и state machine** · Гейт: C5
+**S16 — Task Engine: модель задачи и state machine** · ВЫПОЛНЕН · Гейт: C5
 - Критерии завершения: каждый переход документирован и тестируется · нельзя выставить SUCCEEDED без процедуры проверки · состояние не зависит от текста модели.
+- Факт: `backend/seraphim/core/task_model.py` (TaskMode, TaskStatus, StepStatus, PlanStep, TaskResult, VerificationReport, Task, create_task, check_invariants) и `core/task_machine.py` (единый `transition()` с таблицей `ALLOWED`, 30 рёбер, 15 типов событий). 88 офлайн-тестов в `backend/tests/core/test_task_machine.py`: матрица «каждое событие × каждый статус», таблица задокументированных рёбер с проверкой полного покрытия `ALLOWED`, терминальные состояния, approval, retry-бюджет, инварианты. Полный набор 1098 PASS / 1 skip, ruff PASS. Исправлено по ходу: тупик Pause→Resume из RETRYING, оставшийся pending approval после Pause из NEEDS_APPROVAL, SUCCEEDED-шаг без отчёта проверки. Незакрыто: персистентность (S17), исполнение через WINGS и реальные verifier'ы (S19–S21) — пока проверку выдаёт только вызывающий код через `Verified(report)`.
 
-**S17 — Task/session persistence и resume**
+**S17 — Task/session persistence и resume** · ВЫПОЛНЕН
 - Критерии завершения: состояние восстанавливается после остановки процесса · повторный resume не дублирует работу · неполные/несовместимые задачи требуют review вместо слепого продолжения.
+- Факт: миграция `0002_task_persistence` (append-only; добавляет `tasks.revision` и поля ожидания/результата/review, таблицы `task_steps`, `tool_calls`, `checkpoints`). `core/task_store.py`: `TaskRepository` (insert/load/list_tasks/save с проверкой ревизии, одна транзакция на изменение состояния + чекпоинт + событие; `set_review`) и `ToolCallLedger` (begin/finish/open_calls/mark_unknown). `core/task_service.py`: list/show/pause/resume/cancel и `recover()`. Коды ошибок: TASK_NOT_FOUND, TASK_REVISION_CONFLICT, TASK_REVIEW_REQUIRED. 35 тестов в `backend/tests/core/test_task_persistence.py`. Полный набор 1133 PASS / 1 skip, ruff PASS. Ручная проверка: задача создана в одном процессе, в новом процессе восстановлена как RUNNING и отправлена на review.
+- Открыто: исполнитель шагов и WINGS не подключены (S19), ledger протестирован как хранилище. Отдельного репозитория сессий нет (только `tasks.session_id`). Исправлен попутно баг `MigrationRunner._write_meta` (UPDATE schema_meta с лишним плейсхолдером).
 
-**S18 — Planner и структурированный план**
+**S18 — Planner и структурированный план** · ВЫПОЛНЕН (частично, см. факт)
 - Критерии завершения: план отображается и сохраняется структурированно · некорректный план не начинает частичное выполнение · попытки ремонта формата ограничены.
+- Факт: `core/plan.py` (строгий парсер: дубликаты ключей, NaN, неизвестные поля; граф: дубли id, self/missing/cycle; лимиты 20 шагов, 64 КБ, 500 символов). `core/planner.py`: `Planner` через `ModelProvider.generate()`, ремонт формата не больше `max_repairs` (по умолчанию 2), недоверенный текст только в user-сообщении; `to_task()` переводит готовый план в `Task` (локальные id → `step_<uuid>`, `risk_hint` и `constraints` сохраняются в `plan_json`). Миграция не нужна. 31 тест в `backend/tests/core/test_planner.py`. Полный набор 1164 PASS / 1 skip, ruff PASS.
+- Отклонение от критерия: high-risk шаги (`external`, `destructive`) только помечаются (`risk_hint`), запуск не блокируется. По решению пользователя AEGIS-gate переносится на S20; до S20 пометка не означает разрешения.
+- Незакрыто: отображение плана (CLI/UI) не реализовано; старт задачи из плана через TaskService не подключён (исполнитель — S19/S24).
 
-**S19 — WINGS: registry инструментов и tool contract** · Гейт: ADR-011, ADR-016
+**S19 — WINGS: registry инструментов и tool contract** · Гейт: ADR-011, ADR-016 · ВЫПОЛНЕН
 - Критерии завершения: вызовы имеют единый формат · описание инструмента доступно CORE и UI · неизвестный или disabled tool не исполняется.
+- Факт: `wings/manifest.py` (ToolManifest: id `tool.<name>`, description, input/output JSON Schema, capabilities, risk, side_effects, permissions, timeout 1..600, supports_cancellation, idempotency, source core|mcp|bridges|skill, version dotted integers). `wings/calls.py` (ToolCall: call_id, tool_id, arguments, task_id, step_id; ToolResult: call_id, tool_id, status SUCCEEDED|FAILED|CANCELLED|TIMED_OUT|REJECTED, duration_ms, output, artifact_refs, error {code, safe_message, retryable}). `wings/registry.py` (ToolRegistry: register/unregister/enable/disable/discover/describe/call; ToolProvider — протокол `invoke(manifest, arguments)`). 33 теста в `backend/tests/wings/test_registry.py`. Полный набор 1197 PASS / 1 skip, ruff PASS.
+- Правило конфликта capability: одна capability не может быть у двух tool из разных `source`; внутри одного source — разрешено.
+- Незакрыто: cancellation и timeout реально не прерывают provider (нет потоков/таймеров; S22/S23); AEGIS-проверки в `call()` нет (S20 добавит шаг до исполнения); MCP/BRIDGES providers не подключены (S38, S-BRIDGES); artifact_refs всегда пустые; CLI/UI описаний ещё нет.
 
 **C6 — CHECKPOINT: Task Engine, persistence, Planner и WINGS contracts**
 

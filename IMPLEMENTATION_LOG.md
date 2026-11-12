@@ -3206,3 +3206,173 @@ feat: S14 streaming and tool-call normalization
 
 `backend/tests/compass/test_router.py` — 21 тест: ручной режим, правила, детерминизм,
 fallback, таймаут, фильтр возможностей, приватность и offline, конфигурация.
+
+## S16 — Task Engine: модель задачи и state machine
+
+Пакет `backend/seraphim/core/`: `task_model.py` (типизированные данные, инварианты результата)
+и `task_machine.py` (единственная точка изменения статуса — `transition()`, таблица `ALLOWED`).
+Модель не получает доступа к тексту ответа; проверку выдаёт `Verified(report)` от верификатора.
+
+### Верификация
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest backend/tests/core -q        # 88 passed
+.\.venv\Scripts\python.exe -m pytest -q                            # 1098 passed, 1 skipped
+.\.venv\Scripts\python.exe -m ruff check backend/                  # All checks passed!
+```
+
+### Найдено и исправлено тестами
+
+- Pause из RETRYING → Resume уводил задачу в RUNNING с упавшим шагом, у которого есть бюджет: тупик. Resume теперь возвращает в RETRYING при наличии бюджета.
+- Pause из NEEDS_APPROVAL оставлял `pending_approval_step`, нарушая инвариант. Pause очищает его.
+- `PlanStep(status=SUCCEEDED)` без отчёта принимался. Теперь отвергается.
+
+### Незакрыто
+
+- Персистентность и resume — S17. Verifier'ы и WINGS — S19–S21. Сейчас не проверено на реальных шагах.
+
+## S17 — Task/session persistence и resume
+
+Миграция `0002_task_persistence` (append-only, ADR-007): `tasks` получает `revision`, ожидание
+approval/verification, результат и флаг review; новые таблицы `task_steps`, `tool_calls`, `checkpoints`.
+Слой хранения: `core/task_store.py` (TaskRepository, ToolCallLedger), сервис: `core/task_service.py`.
+
+### Верификация
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest backend/tests/core -q        # 123 passed (88 S16 + 35 S17)
+.\.venv\Scripts\python.exe -m pytest -q                            # 1133 passed, 1 skipped
+.\.venv\Scripts\python.exe -m ruff check backend/                  # All checks passed!
+```
+
+Ручная проверка: создание задачи и `prepare`/`start` в одном процессе; отдельный процесс открывает
+ту же БД, вызывает `recover()` — задача в RUNNING восстановлена и отправлена на review
+(`status cannot be continued after restart`).
+
+### Найдено и исправлено
+
+- `MigrationRunner._write_meta`: `UPDATE schema_meta ... WHERE id = ?` получал два значения
+  вместо трёх. Ветка раньше не выполнялась, т.к. миграция 0001 всегда вставляла строку. Миграция 0002
+  выявила ошибку при второй миграции. Исправлено.
+- Два теста S17 сами делали недопустимый переход (Pause из READY/PAUSED): исправлены на корректные
+  переходы; машина правильно отказывала.
+
+### Решения
+
+- Состояние меняется только через `TaskRepository.save()`: проверка ревизии, запись шагов, чекпоинта
+  и события в одной транзакции.
+- Задача под review принимает только CANCELLED/FAILED/BLOCKED (закрытие оператором).
+- Открытый tool call при восстановлении переводится в UNKNOWN, задача идёт на review, вызов не повторяется.
+- RUNNING/VERIFYING/NEEDS_APPROVAL/RETRYING после рестарта всегда на review; PAUSED остаётся PAUSED.
+
+### Незакрыто
+
+- Исполнитель шагов и WINGS-вызовы не реализованы (S19): ledger проверен как хранилище, не как путь исполнения.
+- Нет отдельного репозитория сессий (`sessions`): есть только колонка `tasks.session_id`.
+- Перенос результата (outputs) в `artifacts` не реализован; сейчас только `result_json`.
+- Ручная проверка через CLI-команды отсутствует: команд `task` в CLI ещё нет.
+
+## S18 — Planner и структурированный план
+
+Схема и проверки плана: `core/plan.py` (`parse_plan_json`, `check_plan`). Планировщик через
+`ModelProvider`: `core/planner.py` (`Planner`, `to_task`, `require_ready`). Сохранение: план пишется
+в `tasks.plan_json` как объект `{constraints, steps}` (миграции не понадобилось: S17 не выпускался).
+
+### Верификация
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest backend/tests/core/test_planner.py -q   # 31 passed
+.\.venv\Scripts\python.exe -m pytest backend/tests -q                         # 1164 passed, 1 skipped
+.\.venv\Scripts\python.exe -m ruff check backend/seraphim backend/tests       # All checks passed!
+```
+
+Ручная проверка: валидный граф (`a` → `b`) проходит `check_plan` и `ready=True`; JSON с обрывом
+`{"goal": "g", "steps": [` отвергается с PLAN_VALIDATION_FAILED и позицией ошибки.
+
+### Решения
+
+- Готовность плана = отсутствие ошибок `check_plan`. Цикл, self/missing dependency, дубль id, пустой
+  или слишком большой план не дают `ready`. `to_task` и `require_ready` отказывают, и в хранилище
+  ничего не пишется (тест).
+- Ремонт формата ограничен `max_repairs`; ошибка провайдера (`ProviderError`) не тратит попытку.
+- Текст из документов передаётся в user-сообщении как данные; system-политика фиксирована. Поле
+  `constraints` из JSON сохраняется, но не влияет на `risk_hint` и проверки.
+- High-risk (`external`, `destructive`) только помечается. `requires_approval` не выставляется:
+  в S16 он блокирует запуск, а выбрано «только пометка».
+
+### Отклонение от критерия
+
+- Критерий «high-risk требует AEGIS review» не выполнен в S18: AEGIS отсутствует. Перенесено на S20.
+
+### Незакрыто
+
+- Отображение плана в CLI/UI не реализовано.
+- Старт задачи из плана через TaskService не подключён.
+- AEGIS-gate для high-risk шагов (S20).
+
+## S19 — WINGS: registry инструментов и tool contract
+
+Пакет `seraphim/wings`: `manifest.py` (ToolManifest), `calls.py` (ToolCall, ToolResult, ToolError,
+CallStatus), `registry.py` (ToolRegistry, протокол ToolProvider). Реестр не импортирует task DB,
+UI или AEGIS; он видит только манифесты и объекты провайдеров.
+
+### Верификация
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest backend/tests/wings -q     # 33 passed
+.\.venv\Scripts\python.exe -m pytest backend/tests -q           # 1197 passed, 1 skipped
+.\.venv\Scripts\python.exe -m ruff check backend/seraphim backend/tests   # All checks passed!
+```
+
+Тесты: схема манифеста (id, input_schema, timeout, version, source/risk, дубль capability), дубль
+id (повтор не заменяет провайдер), конфликт capability между source, enable/disable (disabled не
+исполняется и не виден в discover), неизвестный tool, проверка аргументов до вызова провайдера,
+успех/ошибка/внутреннее исключение без утечки текста, единый ключевой набор ToolResult.to_dict.
+
+### Найдено и исправлено
+
+- `tool.` проходил проверку id (`count(".") >= 1`). Исправлено: требуется непустое имя после префикса.
+- Конфликт capability первоначально писался с мёртвым условием; заменён реальной проверкой.
+
+### Решения
+
+- ToolCall (WINGS) — запрос на исполнение с call_id; это не модельный ToolCall из S14, поэтому
+  модельные id сюда не смешиваются.
+- Конфликт capability: одна capability не может быть объявлена tool'ами из разных `source`.
+- Аргументы проверяются по JSON Schema минимально: обязательные поля и запрет неизвестных полей
+  (если заданы `properties`). Полный JSON Schema-валидатор не добавлялся: новой зависимости нет.
+- Регистрация открытая только через `register()` кодом; модель не регистрирует tools.
+
+### Незакрыто
+
+- Cancellation и timeout не прерывают провайдера: поле `timeout_seconds` сохраняется, но не
+  применяется (S22/S23).
+- AEGIS не вызывается; `call()` сейчас исполняет любой enabled tool. Это главный разрыв до S20:
+  вызов в продакшен-путь нельзя пускать до появления AEGIS-шага.
+- Полная JSON Schema-валидация аргументов (типы, enum, вложенность) не реализована.
+- Провайдеры MCP и BRIDGES не подключены; artifact_refs пока не заполняются.
+
+### Исправления после ревью S16–S19
+
+- Аргументы проверяются по типам (string/number/integer/boolean/array/object/null, bool не принимается как число) и рекурсивно по `properties`; до вызова провайдера.
+- `output_schema` проверяется после успешного вызова; нарушение даёт FAILED / TOOL_SCHEMA_INVALID.
+- `timeout_seconds` применяется: провайдер работает в daemon-потоке, по истечении — FAILED / TOOL_TIMEOUT. Ограничение: поток нельзя принудительно остановить, он продолжает работать в фоне до конца вызова.
+- Fail-closed: инструмент с `side_effects` кроме `read` отклоняется (TOOL_PERMISSION_DENIED) до появления AEGIS (S20).
+- `ToolManifest.schema_version` = 1; неизвестная версия отклоняется; поле попадает в `to_dict()`.
+- Тесты: 9 новых в `tests/wings/test_registry.py` (тип аргумента, bool≠number, вывод вне схемы, таймаут, fail-closed, schema_version).
+
+### Режимы и подтверждение (task_machine)
+
+- OBSERVE: шаги с `risk_hint` кроме `none`/`read` отклоняются (TASK_INVALID) на StartStep.
+- `external`/`destructive` требуют подтверждения в любом режиме (NEEDS_APPROVAL), даже без `requires_approval`.
+- Тесты: 9 новых в `tests/core/test_task_machine.py`.
+
+### Персистентность (task_store, task_service)
+
+- `TaskRepository.save()` применяет только рёбра из `transition()`; подделка SUCCEEDED через save отклоняется (TASK_INVALID).
+- `TaskRepository.insert()` принимает только новый DRAFT без результата.
+- `ToolCallLedger.begin()` в той же транзакции проверяет RUNNING и отсутствие review (TASK_INVALID / TASK_REVIEW_REQUIRED).
+- `TaskService.recover()`: открытый вызов помечается UNKNOWN и задача уходит на review даже если review уже стоит.
+- Проба: пустой отчёт верификации даёт FAILED шага и задачи (не SUCCEEDED).
+
+Итог: pytest tests — 1221 passed, 1 skipped; ruff — All checks passed.

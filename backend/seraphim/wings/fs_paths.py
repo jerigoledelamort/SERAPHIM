@@ -80,6 +80,10 @@ class FsRoot:
     def path(self) -> Path:
         return Path(self._root)
 
+    def identity(self, relative: str) -> str:
+        """Validated identity; display spelling remains the caller's path."""
+        return os.path.normcase(str(self.resolve(relative, must_exist=False)))
+
     def resolve(self, relative: str, *, must_exist: bool = True) -> Path:
         if not isinstance(relative, str) or not relative:
             raise denied("Path must be a non-empty string.")

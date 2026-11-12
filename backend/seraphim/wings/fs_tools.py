@@ -97,6 +97,10 @@ class FsToolProvider:
             "tool.fs.delete_file": lambda a: fs_ops.delete_path(self._root, a["path"]),
         }
 
+    def policy_resources(self, manifest: ToolManifest, arguments: dict[str, Any]) -> tuple[str, ...]:
+        names = ("path", "to") if manifest.id == "tool.fs.move_path" else ("path",)
+        return tuple(str(self._root.resolve(arguments[name], must_exist=False)) for name in names)
+
     def invoke(self, manifest: ToolManifest, arguments: dict[str, Any]) -> dict[str, Any]:
         handler = self._handlers.get(manifest.id)
         if handler is None:

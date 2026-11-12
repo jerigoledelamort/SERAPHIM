@@ -37,9 +37,12 @@ def _err(code: str, message: str, *, task_id: str = "") -> SeraphimError:
     return SeraphimError(code=code, component=COMPONENT, safe_message=message, task_id=task_id)
 
 
-def fingerprint(*, tool_id: str, arguments: dict[str, Any], task_id: str, step_id: str) -> str:
+def fingerprint(*, tool_id: str, arguments: dict[str, Any], task_id: str, step_id: str, authority_digest: str = "") -> str:
+    binding = {"tool_id": tool_id, "arguments": arguments, "task_id": task_id, "step_id": step_id}
+    if authority_digest:
+        binding["authority_digest"] = authority_digest
     canonical = json.dumps(
-        {"tool_id": tool_id, "arguments": arguments, "task_id": task_id, "step_id": step_id},
+        binding,
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=False,
@@ -106,6 +109,7 @@ class ApprovalService:
         explanation: str,
         resource: str,
         risk: str,
+        authority_digest: str = "",
         ttl_seconds: int = DEFAULT_TTL_SECONDS,
         at: str | None = None,
     ) -> ApprovalRequest:
@@ -115,7 +119,7 @@ class ApprovalService:
         created = at or now_utc()
         validate_timestamp(created)
         request_id = generate_id("approval")
-        fp = fingerprint(tool_id=tool_id, arguments=arguments, task_id=task_id, step_id=step_id)
+        fp = fingerprint(tool_id=tool_id, arguments=arguments, task_id=task_id, step_id=step_id, authority_digest=authority_digest)
         view = preview(arguments)
         row = {
             "id": request_id,
@@ -123,6 +127,7 @@ class ApprovalService:
             "step_id": step_id,
             "tool_id": tool_id,
             "fingerprint": fp,
+            "authority_digest": authority_digest,
             "explanation": explanation,
             "preview_json": json.dumps(view, ensure_ascii=False, sort_keys=True),
             "resource": resource,
@@ -177,6 +182,7 @@ class ApprovalService:
         task_id: str,
         step_id: str,
         at: str | None = None,
+        authority_digest: str = "",
     ) -> ApprovalRequest:
         """Spend an APPROVED request for exactly this operation. Raises if it cannot authorise it."""
         current = self.load(request_id)
@@ -192,7 +198,7 @@ class ApprovalService:
             self._set_status(request_id, EXPIRED, when, from_status=APPROVED)
             self._audit("ApprovalExpired", request_id, EXPIRED, when)
             raise _err(ErrorCode.TASK_INVALID, "Approval expired; the call is not authorised.", task_id=task_id)
-        expected = fingerprint(tool_id=tool_id, arguments=arguments, task_id=task_id, step_id=step_id)
+        expected = fingerprint(tool_id=tool_id, arguments=arguments, task_id=task_id, step_id=step_id, authority_digest=authority_digest)
         if expected != current.fingerprint:
             raise _err(
                 ErrorCode.TASK_INVALID,

@@ -56,6 +56,7 @@ class ToolManifest:
     version: str
     tags: tuple[str, ...] = field(default=())
     schema_version: int = MANIFEST_SCHEMA_VERSION
+    verification: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.schema_version != MANIFEST_SCHEMA_VERSION:
@@ -106,5 +107,6 @@ class ToolManifest:
             "version": self.version,
             "tags": list(self.tags),
             "schema_version": self.schema_version,
+            "verification": list(self.verification),
         }
 

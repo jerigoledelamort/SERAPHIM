@@ -8,6 +8,7 @@ from seraphim.cli.identity import identity_group
 from seraphim.cli.logs import logs_group
 from seraphim.cli.secrets import privacy_group, secrets_group
 from seraphim.cli.status import status_command
+from seraphim.cli.tasks import task_group
 
 
 @click.group()
@@ -23,6 +24,7 @@ cli.add_command(logs_group)
 cli.add_command(status_command)
 cli.add_command(secrets_group)
 cli.add_command(privacy_group)
+cli.add_command(task_group)
 
 
 if __name__ == "__main__":

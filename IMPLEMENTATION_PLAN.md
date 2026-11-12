@@ -217,15 +217,24 @@
 **C7 — CHECKPOINT: AEGIS и безопасные системные инструменты**
 
 **S24 — CORE Executor loop**
+- Статус: реализован offline bounded loop до persisted tool result/pending verification. Durable dispatch/ledger, sequential batch stop, approval round-trip; unknown outcomes блокируются без replay. Runtime budgets и schema/policy gates покрыты тестами. Ограничения: cooperative provider timeout, late-running tool worker не уничтожается; full resume/anti-loop — S26, independent verification — S25. Production isolation не заявляется.
+- Проверки (2026-11-12): полный pytest — 1398 passed / 3 skipped; focused executor — 9 passed; Ruff — PASS перед последним косметическим исправлением теста, повторяется при закрытии этапа.
 - Критерии завершения: task выполняется от goal до tool result · каждый call проходит validation и AEGIS · цикл ограничен и сохраняет события.
 
 **S25 — Verification Engine: постусловия и доказательства**
+- Статус (2026-11-12): реализован offline engine; current postconditions файловых calls компонуются в порядке durable insertion, historical tool results сохраняются; plan/manifest criteria остаются обязательными. Engine блокирует missing mandatory verifier и не разрешает unsafe retry. TaskRepository проверяет persisted report/evidence binding для executor-managed tasks; legacy trusted in-process report API сохранён.
+- Проверки: полный pytest после safety fixes — 1413 passed / 3 skipped (48.30s), Ruff PASS; дополнительный focused verification с move-content composition — 15 passed. Ограничения: directory-tree moves не имеют content inventory; app/screenshot adapters unavailable; legacy reports не превращаются в independent evidence. S26/S27 ещё не начаты.
 - Критерии завершения: у результата есть evidence source/time references · провал verification переводит task в retry/failed/blocked по policy · CLI/UI может показать, что именно проверено.
 
 **S26 — Recovery, anti-loop и checkpoints**
+- Статус (2026-11-12): PASS для conservative offline recovery: transactional inspection, owner/token guard до reserve/begin/approval, persistent budget envelope, content-based action state fingerprints, error signatures, checkpoints. Safe ready cursor допускает explicit resume; VERIFYING — только повтор observation; unknown/stale ownership и interrupted accounting не возобновляются автоматически. BLOCKED терминален.
+- Проверки: полный pytest 1428 passed / 3 skipped (54.20s), Ruff PASS. Subprocess crash до intent/после intent/после effect, competing approval, orphan ledger, active inspection и budget persistence покрыты. Ограничения: нет автоматического снятия stale owner, arbitrary worker kill и универсального reconciliation; report-before-transition разрешается новой независимой verification, не повтором action. Расширенная concurrency fault matrix не исчерпывающая.
 - Критерии завершения: неуспешное действие не повторяется бесконечно · recovery не дублирует non-idempotent call с неизвестным результатом · checkpoint позволяет объяснимый resume.
 
 **S27 — Первый end-to-end сценарий через CLI**
+- Статус (2026-11-12): offline golden реализован через task CLI и отдельный OfflineRuntime seam; create/run/list/show/events/report/inspect/pause/resume/cancel/approve/deny. Golden subprocess подтверждает bytes + independent evidence + persisted result новым процессом, outside sentinel неизменен.
+- Проверки: E2E 13 passed (12.73s), Ruff PASS; финальный полный pytest — 1441 passed / 3 skipped (68.63s). Negative: deny/malformed/provider timeout/loop/path escape/unavailable verifier/pause-resume/cancel/approval restart. Real tool late-effect/crash сценарии покрыты CORE tests, не CLI subprocess. Руководство `docs/CORE_E2E.md`.
+- Runtime/service errors возвращают JSON type/code и exit 1; Click usage errors — text/exit 2. Дополнительно проверены approval denial и CLI отказ resume unknown ledger. Exhaustive negative E2E matrix и production isolation не заявляются. C8 отдельно не утверждён.
 - Критерии завершения: golden vertical scenario проходит из чистого test root · negative scenarios доказывают безопасное поведение · events показывают последовательность действий.
 
 **C8 — CHECKPOINT: CORE end-to-end milestone** · **MVP-гейт: до его прохождения блокируются блоки G–N, кроме подготовки документов**
@@ -438,3 +447,25 @@
 ---
 
 *Конец IMPLEMENTATION_PLAN.md S01.*
+
+
+## S24–S27 checkpoint corrective implementation — 2026-11-12
+
+Implemented the approved four-defect correction without advancing the stage:
+- Versioned canonical task authority (root, enabled manifests/contracts and provider configuration), durable operation resources/sensitivity and approval digest; reject root/schema/version/contract drift before approval budget accounting/consumption. Execution uses a pinned manifest/provider registry entry and re-evaluates current AEGIS policy.
+- Diagnostic `check()` remains ineligible for `Verified`. Durable managed-verification marker survives execution-state deletion. Authoritative runs bind revision, pending target, complete shared requirements, authority, dispatch/result history and exact evidence/outcomes; repository validates and consumes the run atomically with the state transition. Legacy state-machine-only tasks remain separate from runtime-managed tasks.
+- Guarded `FsRoot.identity()` composes equivalent mutable filesystem paths, including both move ends. Plan criteria default to step scope and are preserved through consumed accepted step runs; structured JSON criterion `scope=final` is reobserved at final completion. Arbitrary plan/manifest obligations are not last-write-wins. Tool ledger obligations and composed final outputs remain mandatory.
+- Append-only migration 0007 adds eligibility/authority columns and authorizations. Existing migration text is unchanged. Populated v6 tasks/approvals/events/evidence/runs migrate without retroactively gaining authority; idempotence and failure rollback are exercised.
+
+Final verification completed: full suite 1469 passed / 3 skipped (90.08s). Per the user's explicit no-subagent request, the renewed checkpoint was a separate self-review pass, not an independent external audit. Scoped verdict: READY TO COMMIT for the offline S24–S27 slice; no commit/push, UI, dependencies or live-provider/network changes. Existing timeout/cancel, OS-isolation and ADR-005/015/016 limitations remain open. Directory moves still lack recursive content inventory; arbitrary third-party provider configuration needs an explicit authority adapter before production use. Authority intentionally binds the whole registry, so even an unrelated tool manifest change requires review.
+
+
+Corrective verification commands/results at final product revision:
+- `.venv/Scripts/python.exe -m pytest backend/tests/core backend/tests/wings backend/tests/test_storage_migrations.py -q` — **406 passed / 2 skipped** (46.37s).
+- `.venv/Scripts/python.exe -m pytest backend/tests/e2e -q` — **14 passed** (14.84s), including network-disabled changed-root approval restart negative.
+- `.venv/Scripts/python.exe -m pytest backend/tests/core/test_authority_regressions.py -q` — **23 passed** (14.92s).
+- `.venv/Scripts/python.exe -m ruff check backend/` — **PASS**.
+- `git diff --check` — **PASS** (existing LF/CRLF normalization warnings only).
+Skips remain host limitations: privileged filesystem symlinks (filesystem and storage path tests) and Windows directory write-permission bits. No new semantic skip was introduced. Independent reviewer verdict is not claimed by these implementation results.
+
+Final no-subagent checkpoint: **1469 passed / 3 skipped** full suite (90.08s); **40 passed** authority+verification (19.60s); **14 passed** CLI E2E (14.90s); CORE/WINGS/migrations **406 passed / 2 skipped** (41.97s, before two added tests included in the full suite). Ruff/diff checks passed. Self-review added complete diagnostic rejection and provider-swap regression tests. Four original defects are covered. Verdict **READY TO COMMIT** applies only to the offline slice; manual host-dependent checks and production limitations remain as documented in docs/CORE_E2E.md. No commit/push or next-stage work.

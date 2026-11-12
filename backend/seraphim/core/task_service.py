@@ -53,6 +53,13 @@ class TaskService:
 
     def resume(self, task_id: str) -> TaskRecord:
         record = self._tasks.load(task_id)
+        if self._db.query_one("SELECT 1 FROM execution_state WHERE task_id=?", (task_id,)):
+            from seraphim.core.recovery import RecoveryEngine
+
+            checkpoint = RecoveryEngine(self._db).inspect(task_id)
+            if checkpoint["decision"] != "safe_cursor":
+                raise SeraphimError(code=ErrorCode.TASK_REVIEW_REQUIRED, component="core.task_service",
+                                    safe_message="No proven safe execution cursor", task_id=task_id)
         if record.review_required:
             raise SeraphimError(
                 code=ErrorCode.TASK_REVIEW_REQUIRED,
@@ -86,6 +93,15 @@ class TaskService:
         flagged: list[str] = []
         for record in unfinished:
             task_id = record.task.id
+            if self._db.query_one("SELECT 1 FROM execution_state WHERE task_id=?", (task_id,)):
+                from seraphim.core.recovery import RecoveryEngine
+
+                decision = RecoveryEngine(self._db).inspect(task_id)["decision"]
+                if decision in ("review", "owned_inspection_only", "inspect_only"):
+                    flagged.append(task_id)
+                elif record.task.status is T.PAUSED:
+                    paused.append(task_id)
+                continue
             if self._calls.open_calls(task_id):
                 self._calls.mark_unknown(task_id)
                 self._tasks.set_review(task_id, required=True, reason=REVIEW_TOOL_CALL, at=now_utc())

@@ -3475,3 +3475,111 @@ id (повтор не заменяет провайдер), конфликт cap
 - D5: `data_sensitivity` по умолчанию `internal`; CORE должен передавать `secret` явно. Источник классификации данных не определён.
 - Cancel во время записи не прерывает её: статус CANCELLED ставится после возврата вызова. Атомарная запись (temp + os.replace) не оставляет частичный целевой файл.
 - Pause в StepOrchestrator не обработан (TaskService.pause есть); тест Pause во время NEEDS_APPROVAL не написан.
+
+## S24 — CORE Executor loop (2026-11-12)
+
+### Реализовано
+- `core/executor.py`, `execution_model.py`, `bounded_model.py`: offline COMPASS → Planner → persisted task → bounded sequential tool loop → tool-result data → pending verification. Модель не может объявить task success.
+- Runtime-owned turns/calls/batch/arguments/history/output/token/time budgets; bounded ожидание model adapter. `execution_state` хранит transcript/counters/cursor, промежуточный batch не объявляется ready. Interrupted cursors блокируются до S26 reconciliation.
+- `dispatch_store.py`, migration 0004: durable reservation и intent/ledger до invocation, normalized result/event после. Unknown failures/timeouts не ретраятся и требуют review. Состояние сохраняется вне transaction invocation.
+- Orchestrator: initial/later approvals с точной persisted operation, один StartStep на attempt; cross-instance cancel и запрет второго pending dispatch. Executor approval wrapper возвращает результат модели и применяет оставшийся бюджет.
+- Plan v2: optional required_tools/timeout_seconds, чтение legacy v1. AEGIS roots/timeouts enforced; неизвестные resource semantics fail-closed. Root-limited process execution отклоняется: cwd не является OS sandbox. Nonzero process result останавливает batch.
+
+### Проверки
+- Baseline `.venv/Scripts/python.exe -m pytest -q`: 1378 passed / 3 skipped.
+- Промежуточный полный прогон выявил новую RequestApproval edge без записи в documented edges; тест дополнен. Следующий прогон выявил hardcoded plan schema v1; обновлён test + добавлен legacy round-trip.
+- Полный `.venv/Scripts/python.exe -m pytest -q`: 1398 passed / 3 skipped (46.02s), до последнего bounded-model wrapper; focused после wrapper `.venv/Scripts/python.exe -m pytest backend/tests/core/test_executor.py backend/tests/core/test_planner.py -q`: 40 passed.
+- `.venv/Scripts/python.exe -m ruff check backend/`: PASS.
+- Review выявил approval transcript, batch crash cursor, ложную process root confinement и nonzero exit classification; исправлены. Сеть/live provider/UI не запускались.
+
+### Evidence и ограничения
+- `test_executor.py`: goal → файл с проверенными тестом байтами → persisted tool result → tool message, multiple calls/один attempt, first failure stops batch, output/argument/batch/turn limits, provider timeout, approval round-trip.
+- `test_orchestration.py` / `test_dispatch_store.py`: intent видим до side effect, unknown исход блокируется, cancellation между экземплярами, recovered UNKNOWN нельзя перезаписать поздним result.
+- Legacy event IDs сохранены: TaskCreated→task.created, TaskStarted→task.started, StepStarted→step.started, ToolCallStarted→tool.call.started, ToolCallCompleted→tool.call.completed; ToolCallUnknown — отдельная диагностика. Исторические строки не переписываются.
+- Thread timeout ограничивает ожидание, но не уничтожает adapter worker; unknown effect требует review. Cancellation не rollback. Secret classification по-прежнему caller-owned; raw bounded context/results в локальной DB могут содержать пользовательские данные, credential transmission и production logging не объявляются готовыми.
+- S25 verification, S26 full recovery/anti-loop, S27 CLI ещё не выполнены. Live-provider и OS isolation не заявлены.
+
+## S25 — Verification Engine (2026-11-12): PARTIAL / gate BLOCKED
+
+### Реализовано
+- `core/evidence.py`, `core/verification.py`: независимый bounded filesystem read/stat/hash/content; persisted tool/process result evidence; app_state/screenshot без адаптера честно unavailable.
+- Migration 0005: manifest snapshot до invocation, verification_evidence и verification_runs; extended report serialization с source/time/availability/mandatory.
+- Final verification повторно наблюдает mutable outputs. Invalid CheckSpec field types отклоняются. Mandatory unavailable блокирует даже при другом definite fail. Engine не переводит failed postcondition в retry side effect при оставшемся attempt budget.
+- `test_process_evidence.py` реально запускает текущий Python по bare-name allowlist после approval, проверяет persisted exit/stdout evidence и неподходящий expected output. Это не OS sandbox и не live-provider proof.
+
+### Реальные проверки
+- Первый полный pytest: 1 failed / 1405 passed / 3 skipped — hardcoded migration head 4 в S24 test; заменено сравнением с registry head.
+- Повторный `.venv/Scripts/python.exe -m pytest -q`: 1407 passed / 3 skipped (49.19s); `.venv/Scripts/python.exe -m ruff check backend/`: PASS.
+- После дополнительных safety fixes: `.venv/Scripts/python.exe -m pytest backend/tests/core/test_verification.py backend/tests/core/test_process_evidence.py -q`: 12 passed (3.61s); Ruff PASS. Полная regression после этих fixes не выполнялась.
+
+### Нерешённые blockers
+- Historical mutable postconditions конфликтуют: две успешные записи hello → final в один путь требуют оба contents одновременно. Нужны explicit current/final postcondition resolution и отдельное historical evidence, включая moves/deletes и несколько steps; простое удаление ранних требований недостаточно.
+- TaskRepository принимает trusted caller-supplied passing report с dangling evidence_ref без проверки persisted run/task/target binding. Normal engine пишет evidence, но persistence boundary не обеспечивает invariant самостоятельно; model-accessible exploit не заявляется.
+- mandatory=False пока не влияет на report.status: optional unavailable консервативно блокирует. Полная политика advisory checks не завершена.
+- Первоначально S26/S27 не начаты: acceptance gate S25 не пройден. Commit/push, UI, сеть, новые зависимости отсутствуют.
+
+### Исправления после review
+- Пользователь выбрал «Исправить S25». Mutable tool postconditions компонуются отдельно от исторических ledger checks; последовательные writes и write→move проверяют конечный content, source absence и все tool results. Durable insertion order используется вместо timestamp/call-id сортировки.
+- Executor-managed TaskRepository переход с passing report требует persisted verification_run с точным report и evidence task/target/source/time binding. Legacy trusted in-process API сохранён для совместимости, не объявляется независимой проверкой.
+- Optional checks больше не блокируют mandatory passing evidence; пустой или исключительно advisory набор успех не доказывает.
+- Полный `.venv/Scripts/python.exe -m pytest -q`: 1413 passed / 3 skipped (48.30s), Ruff PASS. Дополнительный verification test с move: 15 passed (4.23s).
+- Сохраняются ограничения: plan/manifest criteria не отменяются последующими calls; directory move не даёт recursive content inventory; legacy report API trusted-only. Эти ограничения не разрешают unknown effect replay.
+
+## S26 — Recovery / anti-loop (2026-11-12): PARTIAL, gate BLOCKED
+- Добавлены `anti_loop.py`, `recovery.py`, migration 0006: canonical tool/version/args fingerprint, bounded repeated/alternating action detection, exclusive executor ownership без lease stealing, inspection checkpoints с cursor/context digest/plan/events/evidence/approvals/ledger references.
+- Counters/history сохраняются при смене шага. Recovery не запускает tools, не снимает ownership и не повторяет open intent; uncertain owner/call ставит review. Verification-only различается от safe ready cursor. Resume executor-managed task требует inspection safe_cursor.
+- `.venv/Scripts/python.exe -m pytest backend/tests/core/test_recovery.py backend/tests/core/test_executor.py -q`: 13 passed (3.78s), Ruff PASS.
+- Полный `.venv/Scripts/python.exe -m pytest -q`: 1418 passed / 3 skipped (52.94s), Ruff PASS до последнего resume guard; focused после guard выполняется отдельно.
+- Незавершённые acceptance требования: state/evidence-based progress (нынешний guard консервативно считает повторы без progress reset), stable error signatures, subprocess crash windows, report-before-transition reconciliation, ownership approval path и safe approval restart, fault matrix и migration upgrade с живыми данными.
+- Первоначальный gate был PARTIAL. Пользователь выбрал «Доработать S26»; unknown-effect replay не разрешён, live-provider/OS isolation не заявлены.
+
+### S26 corrections и gate
+- Transactional snapshot сериализован с claims/begin. Active owner inspection не меняет ledger и не крадёт owner. Orphan STARTED/UNKNOWN ledger проверяется независимо от dispatch mapping. Owner token обязателен для executor-managed reserve/begin, approval claim происходит до consume/effect.
+- Persisted original limit envelope не расширяется новым Executor. Approval соблюдает step/global deadline; durable accounting_pending перед invocation блокирует continuation после crash, чтобы время не возвращалось. Direct ownerless orchestrator approval executor task отклоняется.
+- Anti-loop fingerprint включает независимое bounded content/state observation без timestamps; initial write progress не равен повторному unchanged write. Stable error code/action signature сохраняется, ошибки консервативно блокируют без retry.
+- Real subprocess crash matrix: before intent / after intent / after effect before result; ни один unknown effect автоматически не повторяется. Active inspection сохраняет возможность записать actual tool result. Competing owner/approval и orphan ledger покрыты.
+- Полный `.venv/Scripts/python.exe -m pytest -q`: 1428 passed / 3 skipped (54.20s); Ruff PASS. Gate PASS для conservative offline behavior, не universal recovery.
+- Ограничения: stale ownership требует ручного quiescence/reconciliation, автоматического stealing нет; report-before-transition перепроверяется observation, не replay; process/GUI reconciliation unavailable; exhaustive concurrency/fault matrix не заявляется. S27 следующий.
+
+## S27 — Offline CLI E2E (2026-11-12)
+- Добавлен `core/offline_runtime.py`: explicit separate DB/sandbox paths, bounded JSON FakeProvider script, filesystem-only registry, AEGIS allow/deny/ask, driver execution→verification→task final verification.
+- `cli/tasks.py` и регистрация main: create/run/list/show/events/report/inspect/pause/resume/cancel/approve/deny через CORE services. JSON success output, run exit 0 только при SUCCEEDED.
+- `tests/e2e`: реальные CLI subprocess и Click runner. Golden проверяет bytes, filesystem.read evidence, events, persisted success отдельным процессом и unchanged outside sentinel. Negative: policy deny, malformed call, provider timeout, repeated unchanged actions, path escape, unavailable verifier, pause/resume/cancel, approval restart. Socket connection denied в parent и child harness.
+- Первый E2E выявил uncaught path resource rejection в anti-loop observation; исправлено conservative block до invocation. Approval test выявил неверный источник waived rule (user вместо global); composition исправлена по PolicyRule contract.
+- `.venv/Scripts/python.exe -m pytest backend/tests/e2e -q`: 11 passed (10.75s). Ruff PASS. Последний полный pytest до двух дополнительных Click tests: 1437 passed / 3 skipped (66.93s), Ruff PASS.
+- `git diff --check` выявил одну лишнюю EOF blank line в этом логе; удаляется при записи текущего отчёта. LF/CRLF warnings не являются test failures.
+- `docs/CORE_E2E.md`: dedicated commands, manual golden, exact bytes/evidence/events/outside hash checks, exit semantics и ограничения. Ручной walkthrough отдельно не исполнялся; эквивалентный subprocess golden выполнен.
+- Финальный полный `.venv/Scripts/python.exe -m pytest -q`: 1439 passed / 3 skipped (68.43s); `.venv/Scripts/python.exe -m ruff check backend/`: PASS; `git diff --check`: PASS (только LF/CRLF warnings).
+- Добавлены JSON type/code errors без raw messages, approval denial и CLI unknown-ledger resume refusal. Промежуточная ошибка decorator replacement (SyntaxError) исправлена до завершения проверки.
+- Финальные команды: E2E 13 passed (12.73s); full pytest 1441 passed / 3 skipped (68.63s); Ruff PASS; git diff --check PASS (LF/CRLF warnings).
+- Осталось: CLI-specific real tool late-effect/unknown-crash matrix (соответствующие CORE tests есть), exhaustive migration upgrade fixtures. Это не production/live-provider readiness и не автоматическое утверждение C8.
+
+
+## S24–S27 checkpoint corrective implementation — 2026-11-12
+
+Implemented the approved four-defect correction without advancing the stage:
+- Versioned canonical task authority (root, enabled manifests/contracts and provider configuration), durable operation resources/sensitivity and approval digest; reject root/schema/version/contract drift before approval budget accounting/consumption. Execution uses a pinned manifest/provider registry entry and re-evaluates current AEGIS policy.
+- Diagnostic `check()` remains ineligible for `Verified`. Durable managed-verification marker survives execution-state deletion. Authoritative runs bind revision, pending target, complete shared requirements, authority, dispatch/result history and exact evidence/outcomes; repository validates and consumes the run atomically with the state transition. Legacy state-machine-only tasks remain separate from runtime-managed tasks.
+- Guarded `FsRoot.identity()` composes equivalent mutable filesystem paths, including both move ends. Plan criteria default to step scope and are preserved through consumed accepted step runs; structured JSON criterion `scope=final` is reobserved at final completion. Arbitrary plan/manifest obligations are not last-write-wins. Tool ledger obligations and composed final outputs remain mandatory.
+- Append-only migration 0007 adds eligibility/authority columns and authorizations. Existing migration text is unchanged. Populated v6 tasks/approvals/events/evidence/runs migrate without retroactively gaining authority; idempotence and failure rollback are exercised.
+
+Final verification completed: full suite 1469 passed / 3 skipped (90.08s). Per the user's explicit no-subagent request, the renewed checkpoint was a separate self-review pass, not an independent external audit. Scoped verdict: READY TO COMMIT for the offline S24–S27 slice; no commit/push, UI, dependencies or live-provider/network changes. Existing timeout/cancel, OS-isolation and ADR-005/015/016 limitations remain open. Directory moves still lack recursive content inventory; arbitrary third-party provider configuration needs an explicit authority adapter before production use. Authority intentionally binds the whole registry, so even an unrelated tool manifest change requires review.
+
+
+Corrective verification commands/results at final product revision:
+- `.venv/Scripts/python.exe -m pytest backend/tests/core backend/tests/wings backend/tests/test_storage_migrations.py -q` — **406 passed / 2 skipped** (46.37s).
+- `.venv/Scripts/python.exe -m pytest backend/tests/e2e -q` — **14 passed** (14.84s), including network-disabled changed-root approval restart negative.
+- `.venv/Scripts/python.exe -m pytest backend/tests/core/test_authority_regressions.py -q` — **23 passed** (14.92s).
+- `.venv/Scripts/python.exe -m ruff check backend/` — **PASS**.
+- `git diff --check` — **PASS** (existing LF/CRLF normalization warnings only).
+Skips remain host limitations: privileged filesystem symlinks (filesystem and storage path tests) and Windows directory write-permission bits. No new semantic skip was introduced. Independent reviewer verdict is not claimed by these implementation results.
+
+### Final self-review and rerun, without subagents
+- Re-read authority/approval dispatch, pinned registry, authoritative repository transition, shared requirements, recovery and migration boundaries. Added complete diagnostic-report rejection and provider-swap-during-policy regression tests. The latter initially failed because the test used a malformed call ID; corrected the fixture to use generate_id, then reran successfully. No production defect was demonstrated by that fixture failure.
+- `.venv/Scripts/python.exe -m pytest backend/tests/core/test_authority_regressions.py backend/tests/core/test_verification.py -q`: **40 passed** (19.60s).
+- `.venv/Scripts/python.exe -m pytest backend/tests/core backend/tests/wings backend/tests/test_storage_migrations.py -q`: **406 passed / 2 skipped** (41.97s), before the two added tests; both additions are covered by the final full run.
+- `.venv/Scripts/python.exe -m pytest backend/tests/e2e -q`: **14 passed** (14.90s), actual offline CLI subprocesses.
+- `.venv/Scripts/python.exe -m pytest -q`: **1469 passed / 3 skipped** (90.08s).
+- `.venv/Scripts/python.exe -m pytest backend/tests/test_storage_paths.py backend/tests/wings/test_fs_tools.py -q -rs`: **67 passed / 3 skipped** (0.34s), explicit host skip reasons confirmed.
+- Ruff: **PASS**; diff whitespace: **PASS**, LF/CRLF warnings only. The old root full-complete.txt lacks a final summary and is not used as proof of a completed full run. Root output artifacts were initially preserved; subsequently, at the user's explicit cleanup request, e2e-final.txt, focused-final.txt and the incomplete full-complete.txt were removed before committing. Verification results remain recorded here.
+- Scoped verdict: **READY TO COMMIT** for this offline implementation, not production/live-provider readiness. No commit/push or next stage executed. No independent external audit claimed.

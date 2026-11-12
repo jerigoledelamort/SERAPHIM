@@ -48,6 +48,11 @@ class ProcessToolProvider:
         self._sandbox = sandbox
         self._allowed = frozenset(allowed_executables)
 
+    def policy_resources(self, manifest: ToolManifest, arguments: dict[str, Any]) -> tuple[str, ...]:
+        # cwd is not a filesystem sandbox: argv can name arbitrary external paths.
+        # Returning no enforceable resources makes root-limited policy fail closed.
+        return ()
+
     def invoke(self, manifest: ToolManifest, arguments: dict[str, Any]) -> dict[str, Any]:
         result = run_process(
             [arguments["executable"], *arguments.get("argv", [])],

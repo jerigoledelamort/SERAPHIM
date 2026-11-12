@@ -23,9 +23,11 @@ def make_gate(
     execution_context: str = "interactive",
     data_sensitivity: str = "internal",
     confirmed: Callable[[Any], bool] = _never_confirmed,
+    registry: Any = None,
 ) -> Any:
     def gate(manifest: Any, call: Any) -> PolicyDecision:
         try:
+            resources = registry.policy_resources(manifest, call) if registry is not None else ()
             request = PolicyRequest(
                 actor=actor,
                 component=f"wings.{manifest.source}",
@@ -37,6 +39,8 @@ def make_gate(
                 execution_context=execution_context,
                 domain=manifest.capabilities[0].split(".")[0],
                 permissions=tuple(manifest.permissions),
+                resource=";".join(resources),
+                path=resources[0] if resources else "",
                 user_confirmed=bool(confirmed(call)),
             )
             return engine.decide(request)

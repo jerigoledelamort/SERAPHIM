@@ -75,6 +75,33 @@ def _allow(tool_pattern: str, side_effects: tuple[str, ...] = ("read",)) -> Poli
     )
 
 
+def test_limits_fail_closed_without_trusted_resource_resolver(tmp_path):
+    rule = PolicyRule(rule_id="aegis.user.limited", outcome="ALLOW_WITH_LIMITS", source="user",
+                      limits=PolicyLimits(allowed_roots=(str(tmp_path),)))
+    registry, provider, gate = _registry(_manifest(), build_policy_set((rule,)))
+    assert registry.call(_call(), policy=gate).status is CallStatus.REJECTED
+    assert provider.calls == 0
+
+
+def test_move_checks_both_policy_resources(tmp_path):
+    from seraphim.wings.fs_paths import FsRoot
+    from seraphim.wings.fs_tools import register_fs_tools
+
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    (allowed / "a.txt").write_text("safe")
+    registry = ToolRegistry()
+    register_fs_tools(registry, FsRoot(tmp_path))
+    engine = PolicyEngine(build_policy_set((PolicyRule(
+        rule_id="aegis.user.limited", outcome="ALLOW_WITH_LIMITS", source="user",
+        limits=PolicyLimits(allowed_roots=(str(allowed),))),)))
+    call = ToolCall(generate_id("call"), "tool.fs.move_path", {"path": "allowed/a.txt", "to": "outside.txt"})
+    result = registry.call(call, policy=make_gate(engine, actor="tester", registry=registry))
+    assert result.status is CallStatus.REJECTED
+    assert (allowed / "a.txt").read_text() == "safe"
+    assert not (tmp_path / "outside.txt").exists()
+
+
 class TestDenyByDefault:
     def test_unknown_tool_is_not_executed(self) -> None:
         registry, provider, gate = _registry(_manifest(), build_policy_set((_allow("tool.fs.*"),)))

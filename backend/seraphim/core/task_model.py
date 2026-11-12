@@ -73,6 +73,10 @@ class CheckOutcome:
     name: str
     passed: bool
     evidence_ref: str = ""
+    available: bool = True
+    source: str = ""
+    observed_at: str = ""
+    mandatory: bool = True
 
     def __post_init__(self) -> None:
         if not self.name:
@@ -99,8 +103,19 @@ class VerificationReport:
             raise _invalid("Verification checks must be a tuple")
 
     @property
+    def status(self) -> str:
+        required = tuple(c for c in self.checks if c.mandatory)
+        if any(c.available and not c.passed for c in required):
+            return "failed"
+        if required and all(c.available and c.passed for c in required):
+            return "verified"
+        if any(c.passed for c in self.checks):
+            return "partially_verified"
+        return "unverified"
+
+    @property
     def passed(self) -> bool:
-        return bool(self.checks) and all(check.passed for check in self.checks)
+        return self.status == "verified"
 
 
 @dataclass(frozen=True)
@@ -116,6 +131,8 @@ class PlanStep:
     status: StepStatus = StepStatus.PENDING
     attempts: int = 0
     report: VerificationReport | None = None
+    required_tools: tuple[str, ...] = ()
+    timeout_seconds: int | None = None
 
     def __post_init__(self) -> None:
         validate_id(self.id)

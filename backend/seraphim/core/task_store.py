@@ -9,13 +9,15 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from typing import Any
 
 from seraphim.contracts.errors import ErrorCode, SeraphimError
 from seraphim.contracts.ids import generate_id
 from seraphim.contracts.timestamps import now_utc, validate_timestamp
-from seraphim.core.task_machine import transition
+from seraphim.core import authority
+from seraphim.core.requirements import Requirements
+from seraphim.core.task_machine import Verified, transition
 from seraphim.core.task_model import (
     COMPONENT,
     CheckOutcome,
@@ -29,6 +31,7 @@ from seraphim.core.task_model import (
     check_invariants,
 )
 from seraphim.storage.db import Database
+from seraphim.wings.fs_paths import FsRoot
 
 T = TaskStatus
 
@@ -68,7 +71,9 @@ def _report_obj(report: VerificationReport | None) -> dict[str, Any] | None:
     return {
         "verifier_id": report.verifier_id,
         "checks": [
-            {"name": c.name, "passed": c.passed, "evidence_ref": c.evidence_ref}
+            {"name": c.name, "passed": c.passed, "evidence_ref": c.evidence_ref,
+             "available": c.available, "source": c.source, "observed_at": c.observed_at,
+             "mandatory": c.mandatory}
             for c in report.checks
         ],
     }
@@ -79,7 +84,9 @@ def _report_from_obj(data: dict[str, Any] | None) -> VerificationReport | None:
         return None
     return VerificationReport(
         data["verifier_id"],
-        tuple(CheckOutcome(c["name"], c["passed"], c["evidence_ref"]) for c in data["checks"]),
+        tuple(CheckOutcome(c["name"], c["passed"], c["evidence_ref"],
+                           c.get("available", True), c.get("source", ""),
+                           c.get("observed_at", ""), c.get("mandatory", True)) for c in data["checks"]),
     )
 
 
@@ -112,7 +119,7 @@ def _result_from_json(raw: str) -> TaskResult | None:
     )
 
 
-PLAN_SCHEMA_VERSION = 1
+PLAN_SCHEMA_VERSION = 2
 
 
 def _plan_to_json(constraints: tuple[str, ...], steps: tuple[PlanStep, ...]) -> str:
@@ -130,6 +137,8 @@ def _plan_to_json(constraints: tuple[str, ...], steps: tuple[PlanStep, ...]) -> 
                     "max_attempts": s.max_attempts,
                     "requires_approval": s.requires_approval,
                     "risk_hint": s.risk_hint,
+                    "required_tools": list(s.required_tools),
+                    "timeout_seconds": s.timeout_seconds,
                 }
                 for s in steps
             ],
@@ -139,7 +148,7 @@ def _plan_to_json(constraints: tuple[str, ...], steps: tuple[PlanStep, ...]) -> 
 
 def _plan_from_json(raw: str) -> tuple[tuple[str, ...], tuple[PlanStep, ...]]:
     data = json.loads(raw)
-    if data.get("schema_version") != PLAN_SCHEMA_VERSION:
+    if data.get("schema_version") not in (1, PLAN_SCHEMA_VERSION):
         raise _err(ErrorCode.TASK_INVALID, "Stored plan has an unsupported schema version.")
     steps = tuple(
         PlanStep(
@@ -151,6 +160,8 @@ def _plan_from_json(raw: str) -> tuple[tuple[str, ...], tuple[PlanStep, ...]]:
             max_attempts=d["max_attempts"],
             requires_approval=d["requires_approval"],
             risk_hint=d["risk_hint"],
+            required_tools=tuple(d.get("required_tools", ())),
+            timeout_seconds=d.get("timeout_seconds"),
         )
         for d in data["steps"]
     )
@@ -311,7 +322,7 @@ class TaskRepository:
         new_task = transition(record.task, event, at=at)
         with self._db.transaction() as conn:
             current = conn.execute(
-                "SELECT revision, review_required, session_id FROM tasks WHERE id = ?",
+                "SELECT * FROM tasks WHERE id = ?",
                 (new_task.id,),
             ).fetchone()
             if current is None:
@@ -329,6 +340,8 @@ class TaskRepository:
                     task_id=new_task.id,
                     user_action=True,
                 )
+            if isinstance(event, Verified) and current["managed_verification"]:
+                self._validate_verification(conn, current, record, event)
             revision = record.revision + 1
             conn.execute(
                 "UPDATE tasks SET status = ?, updated_at = ?, revision = ?,"
@@ -380,6 +393,40 @@ class TaskRepository:
                 at=at,
             )
         return self.load(new_task.id)
+
+    def _validate_verification(self, conn, current, record, event):
+        def reject():
+            raise _err(ErrorCode.TASK_INVALID, "Report is not a current complete authoritative verification", task_id=record.task.id)
+        if self.load(record.task.id).task != record.task:
+            reject()
+        if event.target != current["pending_verification"] or not current["authority_json"]:
+            reject()
+        if conn.execute("SELECT 1 FROM execution_state WHERE task_id=? AND cancel_requested=1", (record.task.id,)).fetchone():
+            reject()
+        rows = [dict(r) for r in conn.execute("SELECT d.*, l.status AS ledger_status FROM execution_dispatches d LEFT JOIN tool_calls l ON l.id=d.ledger_call_id WHERE d.task_id=? ORDER BY d.rowid", (record.task.id,)).fetchall()]
+        if any(r["status"] in ("UNKNOWN", "STARTED", "WAITING", "RESERVED") or r["ledger_status"] in ("UNKNOWN", "STARTED") for r in rows):
+            reject()
+        if conn.execute("SELECT 1 FROM tool_calls WHERE task_id=? AND status IN ('STARTED','UNKNOWN')", (record.task.id,)).fetchone():
+            reject()
+        roots = {e["root"] for e in json.loads(current["authority_json"])["entries"] if e["root"]}
+        if len(roots) != 1:
+            reject()
+        checks = Requirements(FsRoot(next(iter(roots)))).resolve(record.task, event.target, rows)
+        runs = conn.execute("SELECT a.*,r.requirements_json,r.report_json FROM verification_authorizations a JOIN verification_runs r ON r.id=a.run_id WHERE a.task_id=? AND a.target=? AND a.revision=? AND a.consumed=0", (record.task.id, event.target, record.revision)).fetchall()
+        run = next((r for r in runs if json.loads(r["report_json"]) == _report_obj(event.report)), None)
+        if not run or run["authority_json"] != current["authority_json"] or run["history_json"] != authority.history(conn, record.task.id):
+            reject()
+        if json.loads(run["requirements_json"]) != [asdict(c) for c in checks] or len(checks) != len(event.report.checks):
+            reject()
+        for spec, outcome in zip(checks, event.report.checks, strict=True):
+            evidence = conn.execute("SELECT * FROM verification_evidence WHERE id=? AND task_id=? AND step_id=?", (outcome.evidence_ref, record.task.id, event.target)).fetchone()
+            if not evidence or evidence["source"] != outcome.source or evidence["observed_at"] != outcome.observed_at:
+                reject()
+            data = json.loads(evidence["payload_json"])
+            observation = data["observation"]
+            if data["check"] != asdict(spec) or outcome.name != spec.kind + ":" + (spec.target or spec.call_id) or outcome.mandatory != spec.mandatory or outcome.passed != observation["passed"] or outcome.available != observation["available"] or outcome.source != observation["source"]:
+                reject()
+        conn.execute("UPDATE verification_authorizations SET consumed=1 WHERE run_id=? AND consumed=0", (run["run_id"],))
 
     def set_review(self, task_id: str, *, required: bool, reason: str, at: str) -> TaskRecord:
         validate_timestamp(at)

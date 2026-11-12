@@ -128,6 +128,71 @@ def test_risky_step_waits_for_decision_and_does_not_run(db):
     assert provider.calls == []
 
 
+def test_intent_and_running_step_are_durable_before_provider_effect(db):
+    from seraphim.core.dispatch_store import DispatchStore
+    from seraphim.core.task_store import ToolCallLedger
+
+    task_id, step_id = _running_task(db)
+
+    class InspectProvider(_Provider):
+        def invoke(self, manifest, arguments):
+            record = TaskRepository(db).load(task_id)
+            assert record.task.step(step_id).status.value == "RUNNING"
+            assert record.task.step(step_id).attempts == 1
+            assert len(ToolCallLedger(db).open_calls(task_id)) == 1
+            assert DispatchStore(db).calls(task_id)[0]["status"] == "STARTED"
+            return super().invoke(manifest, arguments)
+
+    provider = InspectProvider()
+    orch = _orchestrator(db, provider)
+    call = _call(task_id=task_id, step_id=step_id)
+    waiting = orch.dispatch(task_id, step_id, call)
+    orch.approve(task_id, step_id, waiting.approval.id, call)
+    assert DispatchStore(db).calls(task_id)[0]["status"] == "COMPLETED"
+
+
+def test_unknown_failure_takes_precedence_over_cancellation(db):
+    from seraphim.core.dispatch_store import DispatchStore
+
+    task_id, step_id = _running_task(db)
+
+    class FailingProvider(_Provider):
+        def invoke(self, manifest, arguments):
+            # A separate orchestrator instance must observe the durable in-flight flag.
+            assert _orchestrator(db, self).cancel(task_id, "stop") is T.RUNNING
+            raise RuntimeError("write may have happened")
+
+    provider = FailingProvider()
+    orch = _orchestrator(db, provider)
+    call = _call(task_id=task_id, step_id=step_id)
+    waiting = orch.dispatch(task_id, step_id, call)
+    outcome = orch.approve(task_id, step_id, waiting.approval.id, call)
+    assert outcome.result.status is CallStatus.FAILED
+    record = TaskRepository(db).load(task_id)
+    assert record.task.status is T.BLOCKED and record.review_required
+    assert DispatchStore(db).calls(task_id)[0]["status"] == "UNKNOWN"
+
+
+def test_later_approval_keeps_running_step_attempt_count(db):
+    task_id, step_id = _running_task(db)
+    provider = _Provider()
+    orch = _orchestrator(db, provider)
+    first = _call(task_id=task_id, step_id=step_id)
+    waiting = orch.run_step(task_id, step_id, first, explanation="e", resource="r", risk="high")
+    orch.approve(task_id, step_id, waiting.approval.id, first)
+    record = TaskRepository(db).load(task_id)
+    assert record.task.step(step_id).status.value == "RUNNING"
+    assert record.task.step(step_id).attempts == 1
+    second = _call("notes/b.txt", task_id, step_id)
+    waiting = orch.dispatch(task_id, step_id, second)
+    assert waiting.approval is not None
+    # Restarting the orchestrator must still execute the persisted operation.
+    resumed = _orchestrator(db, provider)
+    resumed.approve(task_id, step_id, waiting.approval.id, second)
+    assert len(provider.calls) == 2
+    assert TaskRepository(db).load(task_id).task.step(step_id).attempts == 1
+
+
 def test_approved_step_runs_exactly_once(db):
     task_id, step_id = _running_task(db)
     provider = _Provider()

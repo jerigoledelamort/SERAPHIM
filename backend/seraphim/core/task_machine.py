@@ -46,6 +46,11 @@ class StartStep:
 
 
 @dataclass(frozen=True)
+class RequestApproval:
+    step_id: str
+
+
+@dataclass(frozen=True)
 class Approve:
     step_id: str
 
@@ -108,7 +113,7 @@ class Fail:
 
 
 Event = (
-    Prepare | Start | StartStep | Approve | RejectApproval | FailStep | SubmitStep | SubmitTask
+    Prepare | Start | StartStep | RequestApproval | Approve | RejectApproval | FailStep | SubmitStep | SubmitTask
     | Verified | Retry | Pause | Resume | Cancel | Block | Fail
 )
 
@@ -118,6 +123,7 @@ ALLOWED: dict[tuple[TaskStatus, type], frozenset[TaskStatus]] = {
     (T.DRAFT, Prepare): frozenset({T.READY}),
     (T.READY, Start): frozenset({T.RUNNING}),
     (T.RUNNING, StartStep): frozenset({T.RUNNING, T.NEEDS_APPROVAL}),
+    (T.RUNNING, RequestApproval): frozenset({T.NEEDS_APPROVAL}),
     (T.NEEDS_APPROVAL, Approve): frozenset({T.RUNNING}),
     (T.NEEDS_APPROVAL, RejectApproval): frozenset({T.CANCELLED}),
     (T.RUNNING, FailStep): frozenset({T.RETRYING, T.FAILED}),
@@ -194,6 +200,11 @@ def _apply(task: Task, event: object, at: str) -> Task:
             return _finish(task, T.NEEDS_APPROVAL, None, at, pending_approval_step=step.id)
         started = _set_step(task, step, status=StepStatus.RUNNING, attempts=step.attempts + 1)
         return _finish(started, T.RUNNING, None, at, approved_step_id="")
+
+    if isinstance(event, RequestApproval):
+        if task.step(event.step_id).status is not StepStatus.RUNNING:
+            raise _rejected(task, event, "step is not running")
+        return _finish(task, T.NEEDS_APPROVAL, None, at, pending_approval_step=event.step_id)
 
     if isinstance(event, Approve):
         if task.pending_approval_step != event.step_id:

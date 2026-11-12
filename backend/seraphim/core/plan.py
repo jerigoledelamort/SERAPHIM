@@ -19,7 +19,7 @@ RISK_HINTS = ("none", "read", "write", "external", "destructive")
 HIGH_RISK_HINTS = frozenset({"external", "destructive"})
 
 _ALLOWED_STEP_KEYS = frozenset(
-    {"id", "title", "depends_on", "expected_outputs", "verification", "risk_hint", "max_attempts"}
+    {"id", "title", "depends_on", "expected_outputs", "verification", "risk_hint", "max_attempts", "required_tools", "timeout_seconds"}
 )
 _REQUIRED_STEP_KEYS = frozenset({"id", "title", "verification"})
 _ALLOWED_PLAN_KEYS = frozenset({"goal", "constraints", "steps"})
@@ -43,6 +43,8 @@ class PlanStepSpec:
     expected_outputs: tuple[str, ...] = ()
     risk_hint: str = "none"
     max_attempts: int = 1
+    required_tools: tuple[str, ...] = ()
+    timeout_seconds: int | None = None
 
     @property
     def needs_aegis_review(self) -> bool:
@@ -159,6 +161,9 @@ def _step(data: Any) -> PlanStepSpec:
     attempts = data.get("max_attempts", 1)
     if not isinstance(attempts, int) or isinstance(attempts, bool) or not 1 <= attempts <= 5:
         raise _invalid(f"Step {step_id} max_attempts must be an integer 1..5.")
+    timeout = data.get("timeout_seconds")
+    if timeout is not None and (isinstance(timeout, bool) or not isinstance(timeout, int) or not 1 <= timeout <= 600):
+        raise _invalid(f"Step {step_id} timeout_seconds must be an integer 1..600.")
     depends = _str_list(data.get("depends_on"), f"step {step_id} depends_on", limit=MAX_DEPENDS_PER_STEP)
     verification = _str_list(data["verification"], f"step {step_id} verification")
     if not verification:
@@ -171,6 +176,8 @@ def _step(data: Any) -> PlanStepSpec:
         expected_outputs=_str_list(data.get("expected_outputs"), f"step {step_id} expected_outputs"),
         risk_hint=risk,
         max_attempts=attempts,
+        required_tools=_str_list(data.get("required_tools"), f"step {step_id} required_tools"),
+        timeout_seconds=timeout,
     )
 
 

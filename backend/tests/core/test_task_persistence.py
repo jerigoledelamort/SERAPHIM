@@ -390,13 +390,28 @@ class TestPlanSchemaVersion:
     def test_stored_plan_carries_schema_version(self, root: Path) -> None:
         task_id = _seed(root, _draft(_step(S1)))
         raw = _db(root).scalar("SELECT plan_json FROM tasks WHERE id = ?", (task_id,))
-        assert '"schema_version":1' in raw
+        assert '"schema_version":2' in raw
+
+    def test_legacy_version_one_plan_remains_readable(self, root: Path) -> None:
+        import json
+
+        task_id = _seed(root, _draft(_step(S1)))
+        db = _db(root)
+        payload = json.loads(db.scalar("SELECT plan_json FROM tasks WHERE id = ?", (task_id,)))
+        payload["schema_version"] = 1
+        for step in payload["steps"]:
+            step.pop("required_tools", None)
+            step.pop("timeout_seconds", None)
+        db.execute("UPDATE tasks SET plan_json = ? WHERE id = ?", (json.dumps(payload), task_id))
+        step = TaskRepository(db).load(task_id).task.steps[0]
+        assert step.required_tools == ()
+        assert step.timeout_seconds is None
 
     def test_unknown_plan_schema_version_is_rejected_on_load(self, root: Path) -> None:
         task_id = _seed(root, _draft(_step(S1)))
         db = _db(root)
         db.execute(
-            "UPDATE tasks SET plan_json = REPLACE(plan_json, '\"schema_version\":1', '\"schema_version\":9') WHERE id = ?",
+            "UPDATE tasks SET plan_json = REPLACE(plan_json, '\"schema_version\":2', '\"schema_version\":9') WHERE id = ?",
             (task_id,),
         )
         with pytest.raises(SeraphimError) as exc:

@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
+from seraphim.aegis import PolicyEngine, PolicyRule, PolicySet, make_gate
 from seraphim.contracts.errors import ErrorCode, SeraphimError
 from seraphim.contracts.ids import generate_id
 from seraphim.wings import CallStatus, ToolCall, ToolManifest, ToolRegistry
@@ -57,6 +58,23 @@ class _Provider:
 
 def _call(tool_id: str = "tool.fs.read_file", **arguments: Any) -> ToolCall:
     return ToolCall(call_id=generate_id("call"), tool_id=tool_id, arguments=arguments or {"path": "a.txt"})
+
+
+def _allow_read() -> Any:
+    engine = PolicyEngine(
+        PolicySet(
+            rules=(
+                PolicyRule(
+                    rule_id="aegis.user.allow_fs_read",
+                    outcome="ALLOW",
+                    source="user",
+                    tool_pattern="tool.fs.*",
+                    side_effects=("read",),
+                ),
+            )
+        )
+    )
+    return make_gate(engine, actor="test")
 
 
 class TestManifestValidation:
@@ -127,7 +145,7 @@ class TestDuplicateIds:
         registry.register(_manifest(), original)
         with pytest.raises(SeraphimError):
             registry.register(_manifest(), _Provider(output={"text": "other"}))
-        registry.call(_call())
+        registry.call(_call(), policy=_allow_read())
         assert len(original.calls) == 1
 
 
@@ -164,7 +182,7 @@ class TestEnableDisable:
         provider = _Provider()
         registry = ToolRegistry()
         registry.register(_manifest(), provider, enabled=False)
-        result = registry.call(_call())
+        result = registry.call(_call(), policy=_allow_read())
         assert result.status is CallStatus.REJECTED
         assert result.error is not None and result.error.code == ErrorCode.TOOL_PERMISSION_DENIED
         assert provider.calls == []
@@ -174,9 +192,9 @@ class TestEnableDisable:
         registry = ToolRegistry()
         registry.register(_manifest(), provider)
         registry.disable("tool.fs.read_file")
-        assert registry.call(_call()).status is CallStatus.REJECTED
+        assert registry.call(_call(), policy=_allow_read()).status is CallStatus.REJECTED
         registry.enable("tool.fs.read_file")
-        assert registry.call(_call()).status is CallStatus.SUCCEEDED
+        assert registry.call(_call(), policy=_allow_read()).status is CallStatus.SUCCEEDED
         assert len(provider.calls) == 1
 
     def test_disabled_tool_is_hidden_from_discovery_by_default(self) -> None:
@@ -194,7 +212,7 @@ class TestEnableDisable:
 
 class TestUnknownTool:
     def test_unknown_tool_is_not_executed_and_returns_structured_error(self) -> None:
-        result = ToolRegistry().call(_call("tool.fs.ghost"))
+        result = ToolRegistry().call(_call("tool.fs.ghost"), policy=_allow_read())
         assert result.status is CallStatus.REJECTED
         assert result.error is not None and result.error.code == ErrorCode.TOOL_NOT_FOUND
         assert result.output is None
@@ -210,7 +228,8 @@ class TestArgumentsAndResults:
         registry = ToolRegistry()
         registry.register(_manifest(), provider)
         result = registry.call(
-            ToolCall(call_id=generate_id("call"), tool_id="tool.fs.read_file", arguments={})
+            ToolCall(call_id=generate_id("call"), tool_id="tool.fs.read_file", arguments={}),
+            policy=_allow_read(),
         )
         assert result.status is CallStatus.REJECTED
         assert result.error is not None and result.error.code == ErrorCode.TOOL_SCHEMA_INVALID
@@ -220,7 +239,7 @@ class TestArgumentsAndResults:
         provider = _Provider()
         registry = ToolRegistry()
         registry.register(_manifest(), provider)
-        result = registry.call(_call(path="a.txt", shell="rm -rf"))
+        result = registry.call(_call(path="a.txt", shell="rm -rf"), policy=_allow_read())
         assert result.status is CallStatus.REJECTED
         assert provider.calls == []
 
@@ -228,7 +247,7 @@ class TestArgumentsAndResults:
         registry = ToolRegistry()
         registry.register(_manifest(), _Provider())
         call = _call()
-        result = registry.call(call)
+        result = registry.call(call, policy=_allow_read())
         assert result.call_id == call.call_id
         assert result.status is CallStatus.SUCCEEDED
         assert result.output == {"text": "hi"}
@@ -241,7 +260,7 @@ class TestArgumentsAndResults:
             _manifest(),
             _Provider(error=SeraphimError(code=ErrorCode.TOOL_TIMEOUT, component="x", safe_message="too slow")),
         )
-        result = registry.call(_call())
+        result = registry.call(_call(), policy=_allow_read())
         assert result.status is CallStatus.FAILED
         assert result.error is not None
         assert result.error.code == ErrorCode.TOOL_TIMEOUT
@@ -250,7 +269,7 @@ class TestArgumentsAndResults:
     def test_unexpected_exception_does_not_leak_traceback(self) -> None:
         registry = ToolRegistry()
         registry.register(_manifest(), _Provider(error=RuntimeError("secret=abc")))
-        result = registry.call(_call())
+        result = registry.call(_call(), policy=_allow_read())
         assert result.status is CallStatus.FAILED
         assert result.error is not None
         assert result.error.code == ErrorCode.INTERNAL_ERROR
@@ -259,7 +278,7 @@ class TestArgumentsAndResults:
     def test_non_object_output_is_a_failure(self) -> None:
         registry = ToolRegistry()
         registry.register(_manifest(), _Provider(output=["not", "object"]))
-        result = registry.call(_call())
+        result = registry.call(_call(), policy=_allow_read())
         assert result.status is CallStatus.FAILED
 
     @pytest.mark.parametrize(
@@ -271,7 +290,7 @@ class TestArgumentsAndResults:
         provider = _Provider()
         registry = ToolRegistry()
         registry.register(_manifest(), provider)
-        result = registry.call(_call(**arguments))
+        result = registry.call(_call(**arguments), policy=_allow_read())
         assert result.status is CallStatus.REJECTED
         assert result.error is not None and result.error.code == ErrorCode.TOOL_SCHEMA_INVALID
         assert provider.calls == []
@@ -282,12 +301,12 @@ class TestArgumentsAndResults:
         )
         registry = ToolRegistry()
         registry.register(manifest, _Provider())
-        assert registry.call(_call(n=True)).status is CallStatus.REJECTED
+        assert registry.call(_call(n=True), policy=_allow_read()).status is CallStatus.REJECTED
 
     def test_output_violating_output_schema_is_a_failure(self) -> None:
         registry = ToolRegistry()
         registry.register(_manifest(), _Provider(output={"text": 5}))
-        result = registry.call(_call())
+        result = registry.call(_call(), policy=_allow_read())
         assert result.status is CallStatus.FAILED
         assert result.error is not None and result.error.code == ErrorCode.TOOL_SCHEMA_INVALID
 
@@ -303,7 +322,7 @@ class TestArgumentsAndResults:
 
         registry = ToolRegistry()
         registry.register(_manifest(timeout=1), _Hang())
-        result = registry.call(_call())
+        result = registry.call(_call(), policy=_allow_read())
         gate.set()
         assert result.status is CallStatus.FAILED
         assert result.error is not None and result.error.code == ErrorCode.TOOL_TIMEOUT
@@ -314,7 +333,7 @@ class TestArgumentsAndResults:
         manifest = ToolManifest(**{**_manifest().__dict__, "side_effects": side_effects, "risk": "high"})
         registry = ToolRegistry()
         registry.register(manifest, provider)
-        result = registry.call(_call())
+        result = registry.call(_call(), policy=_allow_read())
         assert result.status is CallStatus.REJECTED
         assert result.error is not None and result.error.code == ErrorCode.TOOL_PERMISSION_DENIED
         assert provider.calls == []
@@ -328,8 +347,8 @@ class TestArgumentsAndResults:
     def test_result_dict_has_single_format_for_every_status(self) -> None:
         registry = ToolRegistry()
         registry.register(_manifest(), _Provider())
-        keys = set(registry.call(_call()).to_dict())
-        rejected = set(registry.call(_call("tool.fs.ghost")).to_dict())
+        keys = set(registry.call(_call(), policy=_allow_read()).to_dict())
+        rejected = set(registry.call(_call("tool.fs.ghost"), policy=_allow_read()).to_dict())
         assert keys == rejected == {
             "call_id", "tool_id", "status", "duration_ms", "output", "artifact_refs", "error",
         }

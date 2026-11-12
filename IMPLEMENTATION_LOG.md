@@ -3376,3 +3376,102 @@ id (повтор не заменяет провайдер), конфликт cap
 - Проба: пустой отчёт верификации даёт FAILED шага и задачи (не SUCCEEDED).
 
 Итог: pytest tests — 1221 passed, 1 skipped; ruff — All checks passed.
+
+**S20 — AEGIS: policy engine** · Гейт: C6, ADR-015, ADR-005 · ЧАСТИЧНО (PARTIAL)
+
+### Что сделано
+
+- `backend/seraphim/aegis/policy.py`: решения ALLOW / ALLOW_WITH_LIMITS / ASK_USER / DENY; deny-by-default (`aegis.default.deny`, «No policy rule allows this action.»); неизвестный или неполный запрос даёт DENY (`aegis.request.invalid`); при конфликте побеждает самое строгое решение, затем priority.
+- Только источники `global` и `user` могут выдавать права (ALLOW / ALLOW_WITH_LIMITS). `skill`, `identity`, `project` могут только ограничивать.
+- `backend/seraphim/aegis/baseline.py`: неизменяемые глобальные правила с префиксом `aegis.global.`: destructive и external требуют подтверждения (ASK_USER), secret-данные запрещены (DENY).
+- `backend/seraphim/aegis/gate.py`: `make_gate()` строит PolicyRequest из ToolManifest и ToolCall; любое исключение превращается в DENY (`aegis.gate.evaluation_failed`).
+- `backend/seraphim/wings/registry.py`: `call()` принимает `policy=` (callable, без импорта типов AEGIS). Без gate или при исключении в gate вызов отклоняется до провайдера. Удалено прежнее правило «side_effects кроме read отклоняются».
+- Тесты: `backend/tests/aegis/test_policy.py` (37), `backend/tests/wings/test_aegis_gate.py` (интеграция с реальным движком), `backend/tests/wings/test_registry.py` (вызовы передают `policy=`).
+
+### Незакрыто
+
+- Логирование отказа в OBSERVATORY (`policy.decision`) не подключено; отказ виден только в ToolResult.
+- ADR-015 и ADR-005 не приняты; движок не читает permissions.yaml или БД правил.
+- Проверка путей и корней — S21. Лимиты ALLOW_WITH_LIMITS (timeout, allowed_roots) WINGS не применяет.
+- Gate не подключён к исполнителю задач CORE.
+
+### Проверки
+
+- `.venv/Scripts/python.exe -m pytest backend/tests -q` — 1273 passed, 1 skipped.
+- `.venv/Scripts/python.exe -m ruff check backend/seraphim backend/tests` — All checks passed.
+- Ручная проверка: неизвестный инструмент (`tool.shell.run`) → TOOL_NOT_FOUND, провайдер не вызван; зарегистрированный без правила → TOOL_PERMISSION_DENIED, провайдер не вызван.
+
+**S21 — Ограниченные filesystem tools** · ВЫПОЛНЕН С ОГРАНИЧЕНИЯМИ
+
+### Что сделано
+
+- `wings/fs_paths.py`: `FsRoot.resolve()` проверяет каждый компонент пути. Отказ: `..`, абсолютные пути, `C:`, `\x00`, зарезервированные имена устройств, секретные компоненты (`.git`, `.env*`, `.ssh`, `*.pem`, `*secret*`, `*token*`, и т.д.) на любой глубине, symlink и junction (проверка `lstat` на каждом шаге, затем `realpath` внутри root).
+- `wings/fs_ops.py`: read/list/search/write/create_dir/move/delete. Лимиты: чтение и запись 1 MiB, список 500 записей, поиск 500 файлов и 200 совпадений. Запись: temp-файл в той же директории, `fsync`, `os.replace`; при ошибке временный файл удаляется, исходный не меняется. Удаление переносит файл в `_trash/` (обратимо), корень удалить и переместить нельзя.
+- `wings/fs_tools.py`: 7 манифестов `tool.fs.*`, `FsToolProvider`, `register_fs_tools()`. Все через `ToolRegistry.call()` и AEGIS gate.
+- `contracts/errors.py`: коды `FS_PATH_DENIED`, `FS_NOT_FOUND`, `FS_TOO_LARGE`, `FS_IO_FAILED`, `FS_CONFLICT`.
+- Тесты: `backend/tests/wings/test_fs_tools.py` (45: traversal, junction escape, secret paths, лимиты, atomic write с отказом replace и fsync, отказ без правила, read-only правило не даёт запись, нормализация ошибок, delete/move, корень).
+
+### Проверки на целевой ОС (Windows 11)
+
+- Junction: `mklink /J` без админ-прав работает. Тест реальной junction: чтение `j/...` и запись отклоняются (`FS_PATH_DENIED`), внешний файл не читается и не создаётся.
+- Symlink: без привилегии создание падает (WinError 1314). Тест помечен skip, эскейп через symlink на этом хосте не проверен.
+
+### Незакрыто
+
+- Symlink-тест не выполнен на хосте (нужна привилегия или Developer Mode).
+- Права 0o555 на директорию не действуют на Windows; тест write-в-read-only пропущен.
+- `_trash/` без политики очистки и квоты.
+- Race condition между проверкой пути и открытием: защита частичная (`samestat` при чтении; для записи проверка в момент `replace`, без блокировки каталогов).
+- Поиск не ограничен по глубине каталогов (только по числу файлов).
+- ALLOW_WITH_LIMITS.allowed_roots WINGS не применяет.
+- Логирование отказов в OBSERVATORY не подключено.
+
+### Проверки
+
+- `.venv/Scripts/python.exe -m pytest backend/tests/wings/test_fs_tools.py -q` — 43 passed, 2 skipped.
+- `.venv/Scripts/python.exe -m pytest backend/tests -q` — 1316 passed, 3 skipped.
+- `.venv/Scripts/python.exe -m ruff check backend/seraphim backend/tests` — All checks passed.
+
+**S22 — Ограниченные shell/process tools** · ВЫПОЛНЕН С ОГРАНИЧЕНИЯМИ
+
+### Что сделано
+
+- `wings/process_runner.py`: `run_process(argv, cwd=FsRoot, env_source, timeout_seconds, cancel)`. argv передаётся списком, `shell=False`, stdin закрыт. Исполняемый файл — только bare name, резолвится через PATH из allowlist env. Env: только PATH, SYSTEMROOT, TEMP, TMP, PATHEXT, LANG, LC_ALL. cwd — FsRoot. Timeout 1..120 с. Вывод на каждый поток ограничен 64 КБ и проходит `sanitize_text`.
+- Завершение дерева: Windows — Job Object с `KILL_ON_JOB_CLOSE` (ctypes), процесс назначается в job сразу после старта; POSIX — `start_new_session` и `killpg`.
+- `wings/process_tools.py`: `tool.process.run` (risk high, side_effects external, permission process.run). Arbitrary shell не реализован.
+
+### Проверки
+
+- Ручной прогон (smoke): timeout убивает процесс-внука (tasklist подтверждает), nonzero exit = 3, вывод 500 000 байт обрезан до 65 536, метасимволы (`a&calc.exe|x;y`) переданы литералом, секреты в env не попадают, cancel срабатывает за ~1 с.
+- Тесты: `tests/wings/test_process_runner.py` — 24 passed; `tests/wings/test_process_tool.py` — 4 passed.
+- Полный набор: 1345 passed, 3 skipped. Ruff: All checks passed.
+
+### Ограничения и открыто
+
+- Глобальное правило `external_requires_confirmation` (ASK_USER) перебивает любой user ALLOW; `tool.process.run` поэтому не исполняется, пока не появится механизм approval (S23). Правило не ослаблялось.
+- Windows sandbox: изоляция только cwd и env. Не ограничены: доступ к файлам вне cwd, сеть, реестр, права текущего пользователя. Job Object гарантирует только уничтожение дерева.
+- Symlink-тесты не запускаются на Windows без привилегии создания symlink.
+- Arbitrary shell — отдельная high-risk категория, не реализована.
+
+## S23 — Approval, cancellation и timeout orchestration
+
+### Сделано
+
+- Миграция 0003 `approvals`: id, task/step, tool, fingerprint, explanation, redacted preview, resource, risk, статус, created/expires/decided/consumed.
+- `core/approval.py`: `ApprovalService` — request, decide, consume, pending; fingerprint = sha256(tool, arguments, task, step); single-use через условный UPDATE; истечение проверяется при decide и consume; аудит в events.
+- AEGIS: `waived_when_confirmed` только для глобальных ASK_USER-правил; DENY не снимается; подтверждение действует только для consumed call_id.
+- `core/orchestration.py`: `StepOrchestrator` — рисковый шаг останавливается в NEEDS_APPROVAL; approve/deny; cancel запрашивается, а не форсируется: вызов в процессе доходит до конца, затем задача становится CANCELLED (CANCEL_AFTER_CALL).
+
+### Проверки
+
+- `tests/core/test_approval.py` — 18 passed; `tests/core/test_orchestration.py` — 10 passed (expiry, duplicate approval, reuse для другой операции, cancel before call, cancel during call, timeout during write, deny).
+- Полный набор: 1378 passed, 3 skipped. Ruff: All checks passed.
+- Исправления после review S20–S23: D1 allowlist исполняемых файлов в `run_process` (проверка по точному имени до запуска, пустой список запрещает всё); D3 ASK_USER до старта шага даёт NEEDS_APPROVAL, а не REJECTED; DENY от AEGIS отказывает до создания approval; D5 `data_sensitivity` передаётся в гейт из `run_step`/`approve`, secret → DENY даже при подтверждении; D4 `supports_cancellation=False` у process-инструмента, пока CancelToken не проведён.
+
+### Ограничения и открыто
+
+- D2 частично: таймаут WINGS возвращает TOOL_TIMEOUT с текстом «may still be running, outcome unknown», задача переводится в BLOCKED, новые вызовы отклоняются. Поток провайдера при этом продолжает работу, реальное действие может ещё идти; отмены провайдера нет.
+- D4: process-инструмент не получает CancelToken; cancel ждёт завершения процесса. Решение «проводить CancelToken» отложено.
+- D5: `data_sensitivity` по умолчанию `internal`; CORE должен передавать `secret` явно. Источник классификации данных не определён.
+- Cancel во время записи не прерывает её: статус CANCELLED ставится после возврата вызова. Атомарная запись (temp + os.replace) не оставляет частичный целевой файл.
+- Pause в StepOrchestrator не обработан (TaskService.pause есть); тест Pause во время NEEDS_APPROVAL не написан.

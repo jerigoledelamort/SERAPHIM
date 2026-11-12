@@ -26,6 +26,7 @@ from seraphim.storage.db import Database
 from seraphim.storage.migrations.base import AppliedMigration, Migration
 from seraphim.storage.migrations.m0001_kernel import MIGRATION_0001
 from seraphim.storage.migrations.m0002_task_persistence import MIGRATION_0002
+from seraphim.storage.migrations.m0003_approvals import MIGRATION_0003
 
 COMPONENT = "storage.migrations"
 
@@ -43,7 +44,7 @@ CREATE TABLE schema_migrations (
 """
 
 #: Ordered, forward-only migration registry.  New steps are appended here.
-MIGRATIONS: tuple[Migration, ...] = (MIGRATION_0001, MIGRATION_0002)
+MIGRATIONS: tuple[Migration, ...] = (MIGRATION_0001, MIGRATION_0002, MIGRATION_0003)
 
 
 def _fail(

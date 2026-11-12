@@ -42,6 +42,7 @@ class Start:
 @dataclass(frozen=True)
 class StartStep:
     step_id: str
+    needs_approval: bool = False
 
 
 @dataclass(frozen=True)
@@ -188,7 +189,7 @@ def _apply(task: Task, event: object, at: str) -> Task:
             raise _rejected(task, event, f"step {step.id} has unfinished dependencies")
         if task.mode is TaskMode.OBSERVE and step.risk_hint not in ("none", "read"):
             raise _rejected(task, event, f"step {step.id} changes state and OBSERVE mode forbids it")
-        needs_approval = step.requires_approval or step.risk_hint in HIGH_RISK_HINTS
+        needs_approval = event.needs_approval or step.requires_approval or step.risk_hint in HIGH_RISK_HINTS
         if needs_approval and task.approved_step_id != step.id:
             return _finish(task, T.NEEDS_APPROVAL, None, at, pending_approval_step=step.id)
         started = _set_step(task, step, status=StepStatus.RUNNING, attempts=step.attempts + 1)

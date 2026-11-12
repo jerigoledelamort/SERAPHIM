@@ -1,6 +1,6 @@
 # WINGS registry (S19): registers tool manifests, answers discovery queries and
-# executes enabled tools through their provider. The registry sees only manifests
-# and provider objects: no task DB, no UI state, no AEGIS decisions.
+# executes enabled tools through their provider. Authorization is injected as a
+# PolicyGate callable (S20, AEGIS); the registry never imports AEGIS rule types.
 
 from __future__ import annotations
 
@@ -13,6 +13,8 @@ from typing import Any, Protocol
 from seraphim.contracts.errors import ErrorCode, SeraphimError
 from seraphim.wings.calls import CallStatus, ToolCall, ToolError, ToolResult
 from seraphim.wings.manifest import ToolManifest
+
+PolicyGate = Callable[[ToolManifest, ToolCall], Any]
 
 COMPONENT = "wings.registry"
 
@@ -72,18 +74,20 @@ class ToolRegistry:
         entry = self._get(tool_id)
         return {**entry.manifest.to_dict(), "enabled": entry.enabled}
 
-    def call(self, call: ToolCall) -> ToolResult:
+    def call(self, call: ToolCall, *, policy: PolicyGate | None = None) -> ToolResult:
         entry = self._entries.get(call.tool_id)
         if entry is None:
             return _rejected(call, ErrorCode.TOOL_NOT_FOUND, "Tool is not registered.")
         if not entry.enabled:
             return _rejected(call, ErrorCode.TOOL_PERMISSION_DENIED, "Tool is disabled.")
-        if entry.manifest.side_effects != "read":
-            return _rejected(
-                call,
-                ErrorCode.TOOL_PERMISSION_DENIED,
-                "Tools with side effects need an AEGIS decision; none is connected.",
-            )
+        if policy is None:
+            return _rejected(call, ErrorCode.TOOL_PERMISSION_DENIED, "No policy decision was made for this call.")
+        try:
+            decision = policy(entry.manifest, call)
+        except Exception:
+            return _rejected(call, ErrorCode.TOOL_PERMISSION_DENIED, "Policy could not be evaluated for this call.")
+        if not decision.allowed:
+            return _rejected(call, ErrorCode.TOOL_PERMISSION_DENIED, decision.reason)
         try:
             _check_value(entry.manifest.input_schema, call.arguments, "arguments")
         except SeraphimError as exc:
@@ -92,7 +96,10 @@ class ToolRegistry:
         try:
             output = _invoke_with_timeout(entry, call.arguments)
         except TimeoutError:
-            return _failed(call, started, self._clock(), ErrorCode.TOOL_TIMEOUT, "Tool exceeded its timeout.")
+            return _failed(
+                call, started, self._clock(), ErrorCode.TOOL_TIMEOUT,
+                "Tool exceeded its timeout; it may still be running and its outcome is unknown.",
+            )
         except SeraphimError as exc:
             return _failed(call, started, self._clock(), exc.code, exc.safe_message)
         except Exception as exc:

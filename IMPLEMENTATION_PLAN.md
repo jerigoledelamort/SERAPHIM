@@ -194,14 +194,22 @@
 
 **C6 — CHECKPOINT: Task Engine, persistence, Planner и WINGS contracts**
 
-**S20 — AEGIS: policy engine** · Гейт: C6, ADR-015, ADR-005
+**S20 — AEGIS: policy engine** · Гейт: C6, ADR-015, ADR-005 · ЧАСТИЧНО (PARTIAL)
 - Критерии завершения: каждый tool call проверяется до side effect · policy request содержит достаточный контекст · отказ логируется безопасно и объяснимо.
+- Статус по критериям: (1) выполнено — `ToolRegistry.call()` вызывает gate до провайдера, отказ возвращается как REJECTED; (2) выполнено — `PolicyRequest` содержит actor, component, tool_id, action, side_effects, risk, data_sensitivity, execution_context, domain, permissions; (3) частично — отказ объясняется через `ToolResult.error.safe_message`, но в OBSERVATORY не логируется.
+- Открыто: ADR-015 (хранилище правил) и ADR-005 (изоляция) не приняты, движок получает правила только как входные данные; пути и корни проверяются в S21; лимиты ALLOW_WITH_LIMITS (timeout, allowed_roots) WINGS пока не применяет; gate не подключён к исполнителю задач CORE.
 
-**S21 — Ограниченные filesystem tools**
+**S21 — Ограниченные filesystem tools** · ВЫПОЛНЕН С ОГРАНИЧЕНИЯМИ
 - Критерии завершения: нельзя читать/писать за пределами разрешённых roots · секретные пути не читаются и не индексируются без отдельного разрешения · ошибки I/O нормализованы.
+- Факт: `wings/fs_paths.py` (проверка пути по компонентам, отказ от `..`, абсолютных путей, `C:`, зарезервированных имён, секретных компонентов на любой глубине, symlink/junction), `wings/fs_ops.py` (read/list/search/write/create_dir/move/delete с лимитами размера и атомарной записью temp+`os.replace`), `wings/fs_tools.py` (7 манифестов `tool.fs.*`, провайдер, регистрация). Все вызовы идут через `ToolRegistry.call()` и AEGIS gate. Delete перемещает файл в `_trash`, удаление требует подтверждения (ASK_USER). 45 тестов в `backend/tests/wings/test_fs_tools.py`: 43 PASS, 2 skip. Полный набор 1316 PASS / 3 skip, ruff PASS.
+- Проверено на целевой ОС: junction создаётся без админ-прав и отказывается реальным тестом; symlink на Windows без привилегии не создаётся (WinError 1314), поэтому тест помечен skip.
+- Открыто: symlink-тест не выполнен на этом хосте; права 0o555 на директорию не действуют на Windows (тест skip); `_trash` не очищается и не имеет политики хранения; race condition между проверкой пути и операцией покрыта только частично (проверка `samestat` при чтении, без блокировки каталогов); поиск по файлам идёт без глубины ограничения сверх `MAX_SEARCH_FILES`; ALLOW_WITH_LIMITS.allowed_roots WINGS пока не применяет; логирование отказов в OBSERVATORY не подключено.
 
-**S22 — Ограниченные shell/process tools**
+**S22 — Ограниченные shell/process tools** · ВЫПОЛНЕН С ОГРАНИЧЕНИЯМИ
 - Критерии завершения: аргументы передаются без shell injection · timeout/cancel реально останавливает процесс и доступных потомков · вывод ограничен и редактируется от секретов.
+- Факт: `wings/process_runner.py` (argv без shell, allowlist env, cwd = sandbox, timeout 1..120 с, вывод до 64 КБ с редактированием, cancel; Windows — Job Object `KILL_ON_JOB_CLOSE`, POSIX — process group), `wings/process_tools.py` (`tool.process.run`, risk high, side_effects external). Тесты: `tests/wings/test_process_runner.py` (24), `tests/wings/test_process_tool.py` (4). Полный набор 1345 passed / 3 skipped, ruff PASS.
+- Ограничение: глобальное правило `external_requires_confirmation` даёт ASK_USER, и пользовательский ALLOW не снимает его. Инструмент поэтому не исполняет ни один вызов, пока не появится механизм approval (S23). Это безопасно, но функционально недоступно.
+- Незакрыто: arbitrary shell намеренно не реализован (нужна отдельная high-risk категория); Windows sandbox не изолирует сеть, реестр, файлы вне cwd (только cwd и env); symlink-тесты на Windows без привилегий не запускаются.
 
 **S23 — Approval, cancellation и timeout orchestration**
 - Критерии завершения: рискованное действие ждёт решения до запуска · approval нельзя повторно применить к другой операции · после отмены статус соответствует фактическому состоянию.

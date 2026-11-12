@@ -2258,3 +2258,951 @@ conduct по секретам сохранён: сообщения об ошиб
 ---
 
 *Конец IMPLEMENTATION_LOG.md C4 review follow-up.*
+
+---
+
+## S12 — MODEL LAYER: provider interface и mock
+
+### 1. Цель и объём
+
+Сменяемый интерфейс моделей и детерминированный offline provider, чтобы агентные
+тесты CORE (S16+) шли без сети и без токенов, а capabilities провайдера были
+явными данными, а не догадкой по имени модели. В объём вошли только абстракция,
+нормализованные типы и fake; реальный OpenAI-compatible адаптер — S13, реальный
+стриминг — S14, маршрутизация — S15.
+
+### 2. Компоненты
+
+- `model_layer/capabilities.py` — `ProviderCapabilities` (chat, streaming,
+  tool_calls, vision, structured_output, reasoning_metadata, context_limit,
+  max_output_tokens, max_images, auth kind, supports_cancellation, labels) и
+  `CapabilityFeature`/`AuthKind`. Вывод capability из имени модели отсутствует
+  конструктивно: нет ни `from_model_name`, ни чтения `model` в этом модуле.
+- `model_layer/content.py` — `Message`, `TextPart`/`ImagePart`/`ToolResultPart`,
+  `Role`, `PartKind`. `ImagePart` хранит ссылку (`data_ref`) и не сериализует
+  байты; не-`dict` `content` и чужие части отвергаются нормализованной ошибкой.
+- `model_layer/request.py` — `ModelRequest`, `ToolSpec`; валидация temperature/
+  top_p/max_output_tokens/timeout/response_schema, оценка prompt-токенов,
+  `schema_version` в диапазоне, round-trip неизвестных полей.
+- `model_layer/response.py` — `ModelResponse`, `Usage`, `ToolCall`,
+  `FinishReason`, `normalize_tool_calls()` (JSON-строка или объект; malformed JSON
+  и не-объект → `RESPONSE_FORMAT_INVALID`, частичный вызов не создаётся).
+- `model_layer/cancellation.py` — кооперативный `CancellationToken`.
+- `model_layer/health.py` — `ProviderHealth`, `HealthStatus` (словарь PULSE).
+- `model_layer/stream.py` — конверт `StreamEvent`/`StreamEventType` (минимальный).
+- `model_layer/provider.py` — `ModelProvider` (get_capabilities/health_check/
+  generate/stream/validate_request) и `ProviderHealthMixin`.
+- `model_layer/errors.py` — `ProviderError` + `ProviderErrorKind` (8 видов) на
+  общем envelope; `KIND_TO_CODE`/`KIND_DEFAULTS` задают retryable/
+  user_action_required по умолчанию.
+- `model_layer/versioning.py` — `check_schema_version`/`require`/`require_mapping`/
+  `split_known` (CONTRACTS.md §6.1 для транслируемых сущностей).
+- `model_layer/fake.py` — `FakeProvider`/`FakeTurn` и конструкторы `success`,
+  `with_tool_calls`, `timing_out`, `refusing`, `failing`.
+- `contracts/errors.py` — +4 кода: `PROVIDER_RATE_LIMITED`,
+  `PROVIDER_REQUEST_INVALID`, `PROVIDER_CANCELLED`,
+  `PROVIDER_CAPABILITY_UNSUPPORTED`; `to_diagnostic_dict` санитизирует
+  correlation-поля.
+
+### 3. Как CORE узнаёт capabilities модели
+
+Через `ModelProvider.get_capabilities()` → `ProviderCapabilities`. Это данные,
+которые провайдер (а с S15 — профиль конфигурации) объявляет явно; ничего не
+выводится из `model`/`model_name`. Перед работой вызывается
+`validate_request(request, cancellation)`, который через `caps.require(...)`
+превращает необъявленную возможность в `PROVIDER_CAPABILITY_UNSUPPORTED`, а
+превышение лимитов (context_limit, max_images, max_output_tokens) — в
+`PROVIDER_REQUEST_INVALID`. COMPASS (S15) сможет маршрутизировать по тем же полям.
+
+### 4. Что составляет общий контракт ответа
+
+`ModelResponse`: `id`, `model`, `provider`, `content` (список частей),
+`tool_calls` (нормализованные `ToolCall`), `finish_reason` (`stop`/`length`/
+`tool_calls`/`content_filter`/`refusal`/`error`), `usage` (`prompt_tokens`/
+`completion_tokens`/`total_tokens`/`cached_tokens`/`cost_usd`), `created_at`,
+`schema_version` и `metadata`. Provider-specific данные допускаются только в
+`metadata["provider"][<provider_id>]` и CORE их не интерпретирует. Ошибки —
+`ProviderError` на общем envelope §14.2 (`code`/`message_key`/`component`/
+`retryable`/`user_action_required`/`details_ref`), без stack trace и без значений
+ключей.
+
+### 5. Как тестируется timeout без сети
+
+Скриптованный turn несёт `delay_seconds`; если задержка больше
+`request.timeout_seconds`, `FakeProvider` детерминированно бросает
+`PROVIDER_TIMEOUT` (retryable) до любого ожидания. Реальные сокеты не
+используются — тест `test_no_network_used` патчит `socket.socket`/
+`create_connection` и доказывает отсутствие сети. Отмена проверяется и до работы
+(pre-cancel), и в середине задержки (mid-flight, из отдельного потока), и не
+съедает скриптованный turn и не двигает id.
+
+### 6. Независимое ревью
+
+Два раунда `code-reviewer` (read-only). Раунд 1: 0 BLOCKER, 1 MAJOR (M1 —
+проверки capabilities не были покрыты на реальном пути `generate`, набор оставался
+зелёным при удалении вызова), MINOR m2–m11, NIT n12–n20. Раунд 2 после правок:
+0 BLOCKER, 0 MAJOR.
+
+Закрыто: M1 (класс `TestCapabilityEnforcedOnGeneratePath`; проверено снятием
+`validate_request` — падают 6 из 7 тестов); m2/m3/m9/m10 (пересанитизация на
+сериализации для `StreamEvent`, `ModelResponse`, `ProviderHealth`,
+`ModelRequest`); m4 (проверка отмены до счётчиков и до `_next_turn`);
+m5/m6 (`fixed_created_at`, `reset()` восстанавливает скрипт); m7 (`versioning.py`,
+диапазон версии, round-trip неизвестных полей, `require` вместо `KeyError`);
+m8 (`supports_cancellation` проверяется при переданном токене);
+m11 (`provider_id` санитизируется перед попаданием в `component`); MINOR A–D
+(пересанитизация `ModelRequest`/`ProviderHealth`, санитизация `_extra_fields` и
+correlation-полей); MINOR E (ложноположительный тест заменён на не-итерируемый
+вход); MINOR F–H (явный `minimum`, тесты на `< min` и не-int версию,
+`require_mapping` для не-объектного metadata); n15/n18/n19.
+
+Проверка ложноположительности новых тестов санитизации выполнена откатом фикса:
+оба теста (`test_request_metadata_sanitized_on_serialization`,
+`test_unknown_field_is_sanitized_on_serialization`) падают, затем фикс возвращён.
+
+Осознанно оставлено (не блокирует, задокументировано в §10): `reasoning_metadata`
+— routing-трейт без request-поля, требующего его; `ModelProvider.capabilities()`,
+`ProviderHealthMixin._health_from_error` и `CapabilityFeature.REASONING_METADATA`
+— задел на S13–S15.
+
+### 7. Верификация
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest backend/tests/model_layer -q   # 434 passed
+.\.venv\Scripts\python.exe -m pytest -q                             # 1010 passed, 1 skipped
+.\.venv\Scripts\python.exe -m ruff check backend/                   # All checks passed!
+```
+
+Измерено на текущем дереве. Поддерево `backend/tests/model_layer/` без
+openai_compatible/streaming/privacy-gate: 135 passed (capabilities, errors,
+request/response, fake provider).
+
+Ручная проверка поведения (скрипт, затем удалён; фактические результаты):
+
+```
+1. success      -> text: done | finish: stop | usage: {prompt:2, completion:1, total:3}
+2. tool call    -> finish: tool_calls | calls: [('call_0','filesystem.read_file',{'path':'a.txt'})]
+3. timeout      -> kind: timeout | code: PROVIDER_TIMEOUT | retryable: True   (без сети)
+4. failure      -> kind: auth | code: PROVIDER_AUTH_FAILED | secret leaked: False
+5. cancellation -> pre-cancel -> cancelled PROVIDER_CANCELLED
+6. refusal      -> finish: refusal
+7. capability   -> code: PROVIDER_CAPABILITY_UNSUPPORTED | feature: {'feature':'streaming'}
+                   (провайдер с model='gpt-4o' и пустыми caps не получает streaming)
+8. round-trip   -> ok: True | provider: fake
+```
+
+### 8. Ответы на обязательные вопросы
+
+- **Как CORE узнаёт capabilities модели?** `get_capabilities()` (§3); из имени
+  модели ничего не выводится.
+- **Что составляет общий контракт ответа?** `ModelResponse` + `Usage` + `ToolCall`
+  + `FinishReason` + `ProviderError` (§4).
+- **Как тестируется timeout без сети?** Скриптованная задержка vs
+  `request.timeout_seconds` → `PROVIDER_TIMEOUT` до ожидания (§5).
+
+### 9. Ручные проверки пользователя
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest backend/tests/model_layer -v
+# ожидается 134 passed, включая:
+#   TestSuccess::test_returns_text, test_no_network_used
+#   TestToolCalls::test_tool_call_response
+#   TestTimeout::test_timeout_without_network
+#   TestFailure::test_normalized_failure, test_failure_does_not_leak_secret
+#   TestCancellation::test_pre_cancelled_token_raises,
+#                      test_mid_flight_cancellation_interrupts_delay
+#   TestCapabilityEnforcedOnGeneratePath (6 тестов)
+```
+
+### 10. Риски и долги
+
+1. **Privacy gate не подключён в runtime** (долг S09 §10.1): MODEL LAYER ещё не
+   вызывает `assert_transmission_allowed`; сетевого кода в S12 нет, поэтому
+   критерий «ошибки без auth leakage» выполнен на контракте, а живая проверка
+   privacy появится вместе с реальным адаптером (S13).
+2. **Streaming — заглушка**: `START`→`DONE` без дробления; контракт
+   `StreamEvent` есть, реальная семантика (фрагменты аргументов, порядок,
+   mid-stream cancel) — S14.
+3. **`reasoning_metadata`** объявлен, но ни один запрос его не требует;
+   поведение появится при поддержке провайдеров с reasoning (S13+).
+4. **`ProviderErrorKind` не покрывает «content policy» отдельно**: отказ модели —
+   это `finish_reason=refusal`, а не ошибка; при необходимости отдельного кода
+   добавить в S13/S14.
+5. **Оценка токенов эвристична** (`len/4`); реальный tokenizer появится с
+   адаптером (S13). До этого context-limit проверка приблизительная.
+6. **Стриминг и `supports_cancellation=False`**: базовый `stream` не проверяет
+   `supports_cancellation` при переданном токене — поведение зафиксируется в S14.
+7. Незакоммиченные изменения S07–S11 сохранены; S12 не коммитит (по инструкции).
+
+### 11. Резюме изменений
+
+```
+backend/seraphim/model_layer/
+  __init__.py      — публичный экспорт слоя
+  errors.py        — ProviderError, ProviderErrorKind, KIND_TO_CODE/KIND_DEFAULTS
+  capabilities.py  — ProviderCapabilities, CapabilityFeature, AuthKind
+  content.py       — Message, TextPart/ImagePart/ToolResultPart, Role, PartKind
+  request.py       — ModelRequest, ToolSpec
+  response.py      — ModelResponse, Usage, ToolCall, FinishReason, normalize_tool_calls
+  cancellation.py  — CancellationToken
+  health.py        — ProviderHealth, HealthStatus
+  stream.py        — StreamEvent, StreamEventType
+  provider.py      — ModelProvider, ProviderHealthMixin
+  versioning.py    — check_schema_version, require, require_mapping, split_known
+  fake.py          — FakeProvider, FakeTurn
+backend/seraphim/contracts/errors.py — +4 provider-кода; sanitize correlation-полей
+backend/tests/model_layer/ — 134 теста (capabilities, errors, request/response, fake)
+CONTRACTS.md — §2.5: ошибки и реализация S12
+IMPLEMENTATION_PLAN.md — S12 переведён в ВЫПОЛНЕН
+```
+
+### 12. Предлагаемое сообщение коммита
+
+```
+feat: S12 MODEL LAYER provider interface and offline FakeProvider
+
+- model_layer/capabilities.py: explicit ProviderCapabilities (chat, streaming,
+  tool calls, vision, structured output, reasoning metadata, context limit,
+  max output tokens, max images, auth kind, cancellation); capabilities are
+  never inferred from a model name
+- model_layer/provider.py: ModelProvider interface (get_capabilities,
+  health_check, generate, stream, validate_request); validate_request rejects
+  an undeclared feature or an exceeded limit before any provider work
+- model_layer/{content,request,response}.py: normalized messages, request,
+  response, usage and tool calls; provider-specific data is allowed only under
+  metadata["provider"][<id>] and is never interpreted by CORE
+- model_layer/{cancellation,health,stream}.py: cooperative cancellation token,
+  ProviderHealth with PULSE statuses, minimal stream event envelope
+- model_layer/errors.py: ProviderError with 8 provider-independent kinds mapped
+  onto the shared error envelope; credentials are scrubbed (TB-7)
+- model_layer/fake.py: deterministic offline FakeProvider (success, tool calls,
+  refusal, normalized failure, timeout, cancellation) with stable ids, no I/O
+- model_layer/versioning.py: schema_version range checks and round-trip of
+  unknown optional fields (CONTRACTS.md §6.1)
+- contracts/errors.py: +PROVIDER_RATE_LIMITED, PROVIDER_REQUEST_INVALID,
+  PROVIDER_CANCELLED, PROVIDER_CAPABILITY_UNSUPPORTED; sanitize correlation
+  fields in the diagnostic view
+- tests: 134 new offline tests; 683/684 PASS; ruff check clean
+- independent review (2 rounds): 0 BLOCKER, 0 MAJOR after fixes
+```
+
+---
+
+*Конец IMPLEMENTATION_LOG.md S12.*
+
+---
+
+## S13 — OpenAI-compatible provider: базовые запросы
+
+### 1. Цель и объём
+
+Подключить конфигурируемый OpenAI-compatible endpoint так, чтобы endpoint,
+пути, схема аутентификации, заголовки и набор поддерживаемых возможностей были
+*данными конфигурации*, а не константами исходников; ошибки — понятными и без
+утечки ключа; а весь CI работал offline. В объём вошли chat-запросы без
+стриминга, health check, обнаружение/настройка расхождений и локальные тесты на
+mock HTTP server. Стриминг и полная нормализация tool calls — S14, маршрутизация
+— S15.
+
+### 2. Компоненты
+
+- `model_layer/http_transport.py` — `HttpResponse`, `HttpTransport` (Protocol) и
+  `UrllibTransport`. Транспорт возвращает *любой* HTTP-статус как ответ и
+  поднимает нормализованную ошибку только при сбое соединения
+  (`PROVIDER_TIMEOUT`/`PROVIDER_UNAVAILABLE`). `_safe_url` убирает userinfo из
+  URL перед попаданием в сообщение об ошибке.
+- `model_layer/openai_compatible.py` — `OpenAICompatibleConfig`,
+  `OpenAICompatibleProvider`, `CapabilityProbe`,
+  `build_openai_compatible_provider`. Формирует payload, парсит ответ, маппит
+  статусы в `ProviderError`, публикует/проверяет capabilities.
+- `model_layer/cancellation.py` — добавлена `run_with_cancellation(fn, token,
+  provider_id)`: блокирующий вызов идёт в daemon-потоке, вызывающий поток
+  опрашивает токен и при отмене немедленно поднимает `PROVIDER_CANCELLED`;
+  исключение воркера переподнимается без изменений.
+- `model_layer/errors.py` — добавлен конструктор `provider_rate_limited_error`
+  (для симметрии с остальными видами).
+- `sanctum/config_schemas.py` — `ModelEntry` расширен опциональными
+  транспортными полями: `timeout_seconds`, `chat_path`, `health_path`,
+  `auth_scheme`, `auth_header`, `extra_headers`, `max_tokens_field`,
+  `capabilities`. Добавление опционального поля — minor по CONTRACTS §6.1, поэтому
+  конфиг, написанный до S13, продолжает работать без миграции.
+- `sanctum/loader.py` — `_check_model_headers`: literal-секрет в
+  `providers.models[].extra_headers` отвергается (`SECRET_REF_INVALID`), значение
+  не возвращается в сообщении.
+- `backend/tests/model_layer/test_openai_compatible.py` — 96 тестов,
+  `backend/tests/sanctum/test_provider_transport_config.py` — 4 теста.
+
+### 3. Как endpoint (и всё остальное) настраивается конфигурацией
+
+Все параметры подключения берутся из `providers.models[]`:
+
+```yaml
+providers:
+  schema_version: 1
+  default_model_id: local
+  models:
+    - id: local
+      provider: local_openai
+      model_name: llama3
+      endpoint: http://127.0.0.1:11434      # адрес — данные, не константа
+      secret_ref: provider.local            # только ссылка, не значение
+      timeout_seconds: 5.5
+      chat_path: /v1/chat/completions
+      health_path: /v1/models
+      auth_scheme: api_key                  # bearer | api_key | none
+      auth_header: api-key                  # Azure-подобный вариант
+      max_tokens: 2048
+      max_tokens_field: max_completion_tokens
+      extra_headers: { X-Org: acme }        # literal-ключ здесь отвергается
+      capabilities: { tool_calls: true, context_limit: 8192 }
+```
+
+`build_openai_compatible_provider(entry, secret_resolver=store.get)` превращает
+такую запись в провайдера. Тест `test_endpoint_is_not_hard_coded` поднимает два
+сервера и доказывает, что две записи конфигурации попадают на два разных адреса.
+
+### 4. Маппинг ошибок
+
+| Что вернул endpoint | Код SERAPHIM | retryable |
+|---|---|---|
+| `401`, `403` | `PROVIDER_AUTH_FAILED` | нет |
+| `408` | `PROVIDER_TIMEOUT` | да |
+| `429` | `PROVIDER_RATE_LIMITED` | да |
+| `5xx` | `PROVIDER_UNAVAILABLE` | да |
+| прочие `4xx` (`400`, `404`, `405`, `422`…) | `PROVIDER_REQUEST_INVALID` | нет |
+| `200` с битым JSON / без `choices` / legacy `text`-формой | `RESPONSE_FORMAT_INVALID` | да |
+| `3xx` (редирект) | `PROVIDER_REQUEST_INVALID` | нет |
+| сбой соединения, разрыв | `PROVIDER_UNAVAILABLE` | да |
+| таймаут запроса | `PROVIDER_TIMEOUT` | да |
+| отмена | `PROVIDER_CANCELLED` | нет |
+
+Текст ошибки endpoint используется только после санитизации и обрезки до 200
+символов, поэтому «понятность» не превращается в канал утечки.
+
+Редиректы **не** отслеживаются намеренно: `urllib` по умолчанию пересобирает
+запрос и переносит исходные заголовки (кроме `content-*`) на новый URL, то есть
+отправил бы `Authorization` с ключом на хост, которого оператор не настраивал.
+`UrllibTransport` использует opener с обработчиком, который отказывается от
+редиректа, поэтому `3xx` доходит до адаптера как обычный ответ и превращается в
+понятную ошибку конфигурации.
+
+### 5. Как проверено отсутствие API key в логах
+
+Три независимых барьера и три теста:
+
+1. Ключ читается лениво из `secret_ref` и сразу регистрируется
+   (`register_known_secret`), поэтому его значение вырезается любым
+   `sanitize_text`/`sanitize_dict` — включая конструктор `SeraphimError`.
+2. `_error_detail` дополнительно вырезает точное значение из тела ошибки
+   (`redact_known_secrets(detail, key)`) — до того, как оно станет `safe_message`.
+3. Адаптер логирует только host, модель, число сообщений и число инструментов:
+   ни заголовки, ни ключ в лог не передаются.
+
+Тесты: `test_no_key_in_logs_on_success` и `test_no_key_in_logs_on_failure`
+перехватывают весь вывод логгера `seraphim.model_layer.openai_compatible` и
+проверяют отсутствие ключа и заголовка `Authorization`; при этом тот же тест
+утверждает, что ключ *был отправлен* (`authorization: Bearer <key>` в записи
+mock-сервера) — то есть проверка не вырождена. Тест
+`test_error_body_scrubbed_even_for_an_unknown_key_format` использует ключ без
+узнаваемого формата, поэтому проходит только благодаря точному совпадению.
+
+### 6. Как тестировать провайдер без расхода токенов
+
+Весь набор — на локальном mock HTTP server (`http.server.ThreadingHTTPServer` на
+`127.0.0.1` с эфемерным портом), который пишет полученные запросы, чтобы тест мог
+проверить точный payload и заголовки. Ни один тест не выходит во внешнюю сеть.
+Для негативных сценариев: «медленный» сервер (таймаут), listener, который
+принимает соединение и сразу закрывает его (разрыв), закрытый порт (недоступный
+endpoint), битый JSON и HTML вместо JSON. Отмена проверяется из отдельного
+потока и утверждает, что она срабатывает быстро (< 0.8 c), а не после ответа
+сервера. Live smoke test возможен только вручную и с отдельным согласованным
+профилем; для CI он не нужен.
+
+### 7. Что НЕ поддержано (и почему)
+
+- **Streaming** — S14. Адаптер всегда отправляет `stream: false`; базовый
+  `ModelProvider.stream` требует объявленной capability `streaming` и отдаёт
+  один терминальный `DONE`.
+- **Повтор assistant-сообщения с tool calls в истории** — у нормализованного
+  `Message` пока нет поля для tool calls ассистента (S14); можно передать
+  `ToolResultPart`, но не восстановить сам запрос модели.
+- **Embeddings / rerank / legacy completions** — вне S13; legacy-форма
+  `choices[].text` отвергается как `RESPONSE_FORMAT_INVALID`.
+- **Reasoning-поля** (`reasoning_content`, `reasoning`) — не извлекаются;
+  capability `reasoning_metadata` можно объявить, но поведение появится позже.
+- **Провайдер-специфичные расширения** (Azure `api-version` в query, Anthropic
+  `system`-поле, `logit_bias`, `seed` и т.п.) — не отправляются; из расхождений
+  параметризованы только `auth_header`/`auth_scheme` и имя поля бюджета токенов.
+- **Автоматическое определение возможностей по имени модели** — отсутствует
+  конструктивно.
+- **Строгая валидация `response_format`** — отправляется OpenAI-форма
+  `json_schema`; серверы с другим контрактом должны объявлять
+  `structured_output: false`.
+- **Отслеживание редиректов** — намеренно отсутствует (см. §4): `3xx`
+  превращается в ошибку конфигурации, потому что следование за редиректом
+  отправило бы ключ на другой хост. Если сервис штатно отвечает редиректом,
+  нужно указать конечный URL в `endpoint`.
+
+### 8. Независимое ревью
+
+Один раунд `code-reviewer` (read-only). Итог первого прохода: **1 BLOCKER, 1 MAJOR**,
+5 MINOR, 8 NIT. Оба блокирующих пункта закрыты, MAJOR закрыт, MINOR m1–m5 и часть
+NIT закрыты; оставшиеся NIT осознанно приняты.
+
+- **BLOCKER B1 — ключ мог попасть в `ModelResponse.to_dict()`.** Ответ модели —
+  недоверенные данные (TB-1), а санитизировался только `metadata` (S12). Сервер,
+  только что получивший ключ в заголовке, мог вернуть его в `id`, `model`,
+  `content` или `tool_calls`, и он оказывался в контрактном объекте и любом его
+  дампе. Ревьюер воспроизвёл утечку (`key_in_full_dump: True`). Закрыто: все
+  значения, взятые из тела ответа (`id`, `model`, `content`, `system_fingerprint`,
+  `tool_calls.id/name/arguments/raw_arguments`), проходят через `sanitize_text`/
+  `sanitize_dict` до того, как стать полями контракта. Тесты
+  `test_echoed_key_in_response_fields_is_scrubbed` и
+  `test_echoed_opaque_key_in_response_fields_is_scrubbed`; ложноположительность
+  проверена откатом санитизации `content` — оба теста падают.
+- **MAJOR M1 — редиректы пересылали заголовок с ключом.** `urllib` по умолчанию
+  следует за `3xx` и копирует исходные заголовки (кроме `content-*`) на новый URL,
+  то есть `Authorization` уходил бы на хост, которого оператор не настраивал.
+  Закрыто: `UrllibTransport` собирает opener с `_NoRedirectHandler` (возвращает
+  `None` → статус приходит как обычный ответ), а адаптер маппит `3xx` в
+  `PROVIDER_REQUEST_INVALID` с объяснением; `Location` не эхо-отражается. Тест
+  `test_redirect_is_not_followed` проверяет, что второй сервер не получил ни
+  одного запроса.
+- **m1** — `capability_probe()` получил защитный `except Exception`, приведённый к
+  обещанному «Never raises».
+- **m2** — добавлены тесты на непокрытые ветки `run_with_cancellation`: успешный
+  результат через поток и переподнятие исключения воркера без изменения
+  (`kind`/`code`/`retryable` сохраняются).
+- **m3** — `OpenAICompatibleConfig.to_dict()` теперь прогоняет результат через
+  `sanitize_dict`.
+- **m4** — абсолютный URL в `chat_path`/`health_path` отвергается
+  (`VALIDATION_FAILED`), иначе путь мог увести запрос вместе с ключом на другой хост.
+- **m5** — единый источник дефолта бюджета токенов: `_DEFAULT_MAX_TOKENS = 4096`
+  (зеркалит `ModelEntry.max_tokens`) используется и в схеме, и в фабрике.
+- **n1** — `structured_output_name` помечен как фиксированный в S13.
+- **n2** — `capability_probe().declared` теперь включает и ненаблюдаемые
+  объявленные возможности (`reasoning_metadata`), поэтому объявленное-но-непроверенное
+  не исчезает молча; `supports_cancellation` исключён как клиентский трейт.
+- **n3** — убран мёртвый параметр `request` у `_parse_response`.
+- **n4** — `extra_headers` отвергает управляющие символы (`\r`/`\n`/`\0`).
+- **n5** — усилены слабые тесты: `test_safe_description_contains_no_header_values`
+  проверяет отсутствие значения заголовка и самого поля `extra_headers`;
+  `test_no_key_in_logs_on_failure` дополнительно утверждает, что ключ был реально
+  отправлен; вместо почти вакуумных тестов добавлены
+  `test_adapter_source_does_not_import_a_provider_sdk` (структурная проверка
+  отсутствия vendor SDK) и `test_no_non_loopback_connection_is_attempted`
+  (перехват `socket.connect`: все соединения только на 127.0.0.1).
+- **Принято осознанно:** n7 (фоновый daemon-воркер при отмене, §12.4) и n8
+  (значения короче `MIN_KNOWN_SECRET_LENGTH` не вырезаются точным совпадением —
+  неактуально для реальных ключей).
+
+Отдельно зафиксирована политика: аргументы tool call санитизируются как любой
+другой недоверенный payload, поэтому аргумент с именем-похожим-на-секрет
+(`api_key`, `token`, `password`) будет отредактирован. Это согласуется с S12
+(`metadata`) и с инвариантом «учётные данные не сериализуются»; для реальных
+инструментов SERAPHIM учётные данные передаются ссылками, а не значениями.
+
+### 9. Верификация
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest backend/tests/model_layer -q   # 230 passed
+.\.venv\Scripts\python.exe -m pytest -q                             # 783 passed, 1 skipped
+.\.venv\Scripts\python.exe -m ruff check backend/                   # All checks passed!
+```
+
+До S13: 683 passed, 1 skipped. Добавлено 100 тестов
+(`test_openai_compatible.py` 96, `test_provider_transport_config.py` 4).
+
+Ручная проверка поведения (временный скрипт на локальном сервере, затем удалён;
+фактические результаты после правок по ревью):
+
+```
+1. success        : done | usage_total=13
+2. tool call      : finish=tool_calls calls=[('c1','read_file',{'path':'a'})]
+   verified caps  : tool_calls=True
+3. capability gate: code=PROVIDER_CAPABILITY_UNSUPPORTED kind=capability_unsupported
+4. auth error     : code=PROVIDER_AUTH_FAILED key_leaked=False
+                    msg='endpoint rejected the credential (HTTP 401): bad key [REDACTED]'
+5. echoed key     : key_in_dump=False (7 полей отредактировано)     <- BLOCKER B1
+6. redirect       : code=PROVIDER_REQUEST_INVALID, target hits=0    <- MAJOR M1
+7. rate limited   : code=PROVIDER_RATE_LIMITED kind=rate_limited retryable=True
+8. unavailable    : code=PROVIDER_UNAVAILABLE kind=unavailable retryable=True
+9. malformed body : code=RESPONSE_FORMAT_INVALID kind=response_invalid retryable=True
+10. timeout       : code=PROVIDER_TIMEOUT kind=timeout retryable=True
+11. cancelled     : code=PROVIDER_CANCELLED kind=cancelled  (latency 0.108s)
+12. health        : ONLINE
+    probe         : reachable=True status=200 verified=['chat'] declared=['chat','tool_calls']
+                    unverified_declared=['tool_calls']
+13. from config   : provider=openai text='from-config' | key in config dump=False
+                    round-trip=True
+14. invalid configs: absolute chat_path -> VALIDATION_FAILED
+                    control char header -> VALIDATION_FAILED
+```
+
+Ложноположительность проверена откатом фиксов:
+
+- снятие `validate_request` в `generate` → падают
+  `test_tools_rejected_without_declaration`, `test_context_limit_is_enforced`;
+- снятие `register_known_secret` **и** точной редакции в `_error_detail` →
+  падает `test_error_body_scrubbed_even_for_an_unknown_key_format` (ключ без
+  узнаваемого формата ловится только точным совпадением);
+- снятие санитизации `content` → падают
+  `test_echoed_key_in_response_fields_is_scrubbed` и
+  `test_echoed_opaque_key_in_response_fields_is_scrubbed` (BLOCKER B1).
+
+Все фиксы возвращены, набор снова зелёный.
+
+### 10. Ответы на обязательные вопросы
+
+- **Какие особенности OpenAI-compatible API не поддержаны?** §7: streaming,
+  повтор assistant tool calls в истории, embeddings/rerank/legacy completions,
+  reasoning-поля, провайдер-специфичные расширения (кроме параметризованных
+  `auth_scheme`/`auth_header`/`max_tokens_field`), автоматический вывод
+  возможностей из имени модели, не-OpenAI-форма `response_format`.
+- **Как проверено отсутствие API key в логах?** §5: ленивое чтение +
+  регистрация значения, точная редакция тела ошибки, логирование без заголовков;
+  три теста, включая проверку «ключ был отправлен, но в лог не попал».
+- **Как тестировать provider без расхода токенов?** §6: локальный mock HTTP
+  server на loopback с записью запросов; негативные сценарии — медленный сервер,
+  разрыв соединения, закрытый порт, битый JSON.
+
+### 11. Ручные проверки пользователя
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest backend/tests/model_layer/test_openai_compatible.py -v
+.\.venv\Scripts\python.exe -m pytest backend/tests/sanctum/test_provider_transport_config.py -v
+# ожидается 96 + 4 passed, включая:
+#   TestConfigValidation, TestSuccessfulGeneration, TestHeadersAndAuth,
+#   TestErrorMapping, TestNetworkAndCancellation, TestRedaction, TestCapabilities,
+#   TestHealth, TestFactory
+```
+
+Live smoke test запускать только вручную и только с отдельным согласованным
+тестовым профилем (свой endpoint и свой `secret_ref`); в CI он не входит.
+
+### 12. Риски и долги
+
+1. **Privacy gate всё ещё не подключён в runtime.** Теперь в слое появился
+   реальный сетевой код, поэтому вызов `assert_transmission_allowed` перед
+   отправкой контекста наружу — обязательный долг (S15, вместе с COMPASS).
+   Сейчас адаптер не проверяет `allow_external_transmission`.
+2. **Стриминг — S14.** `stream()` остаётся заглушкой `START`→`DONE`.
+3. **Оценка токенов эвристична** (`len/4`), реального tokenizer нет.
+4. **`run_with_cancellation` оставляет фоновый поток** до завершения сокета: он
+   daemon и его результат отбрасывается, но сам сокет закрывается не мгновенно.
+5. **Проверка capabilities ограничена наблюдением.** `chat` подтверждается
+   успешным обменом, `tool_calls`/`vision`/`structured_output` — только когда они
+   реально использованы; `streaming` не подтверждается вообще до S14.
+6. **`tool_calls[].id` синтезируется**, если сервер его не прислал; факт виден в
+   `metadata["provider"][<id>]["synthesized_tool_call_ids"]`.
+7. **`response_format` отправляется только в OpenAI-форме** `json_schema`; серверы
+   с другим контрактом должны не объявлять `structured_output`.
+8. **Аргументы tool call санитизируются как недоверенный payload.** Аргумент с
+   именем-похожим-на-секрет (`api_key`, `token`, `password`) будет отредактирован
+   (`sanitize_dict`), что согласуется с политикой S12 для `metadata`, но может
+   «испортить» легитимный аргумент. Для инструментов SERAPHIM учётные данные
+   передаются ссылками, поэтому на практике не встречается; при необходимости
+   политику уточнить в S19 (WINGS tool contract).
+9. **Серверные поля ответа санитизируются в адаптере, а не в контракте.**
+   `ModelResponse`/`ToolCall` (S12) по-прежнему санитизируют только `metadata`,
+   поэтому новый адаптер обязан повторить эту обработку. Кандидат на вынос в
+   общий helper при появлении второго HTTP-провайдера.
+10. Незакоммиченные изменения S07–S12 сохранены; S13 не коммитит (по инструкции).
+
+### 13. Резюме изменений
+
+```
+backend/seraphim/model_layer/
+  http_transport.py     — HttpResponse, HttpTransport, UrllibTransport
+  openai_compatible.py  — OpenAICompatibleConfig, OpenAICompatibleProvider,
+                          CapabilityProbe, build_openai_compatible_provider
+  cancellation.py       — +run_with_cancellation
+  errors.py             — +provider_rate_limited_error
+  __init__.py           — экспорт новых имён
+backend/seraphim/sanctum/config_schemas.py — ModelEntry: транспортные поля
+backend/seraphim/sanctum/loader.py         — _check_model_headers
+backend/tests/model_layer/test_openai_compatible.py        — 96 тестов
+backend/tests/sanctum/test_provider_transport_config.py    — 4 теста
+CONTRACTS.md — §2.5: реализация S13
+IMPLEMENTATION_PLAN.md — S13 переведён в ВЫПОЛНЕН
+```
+
+### 14. Предлагаемое сообщение коммита
+
+```
+feat: S13 OpenAI-compatible provider adapter (configured endpoint, offline tests)
+
+- model_layer/openai_compatible.py: adapter for a configurable OpenAI-compatible
+  endpoint; endpoint, paths, auth scheme/header, extra headers, token-budget
+  field and declared capabilities all come from providers.models[] in config
+- model_layer/http_transport.py: stdlib-only HTTP transport behind an injectable
+  seam, so tests run offline against a loopback mock server
+- error mapping: 401/403 -> auth, 408 -> timeout, 429 -> rate limited, 5xx ->
+  unavailable, other 4xx -> invalid request, malformed body -> response invalid,
+  connection failure/timeout/cancellation -> normalized ProviderError
+- credential safety: the key is read lazily from secret_ref, registered with the
+  process-wide redactor, scrubbed out of provider error bodies, never logged, and
+  every field taken from the response envelope (id, model, content, tool calls)
+  is sanitized before it becomes a contract field
+- redirects are not followed: urllib would resend the Authorization header to the
+  redirect target, so a 3xx becomes an explicit configuration error
+- no full-compatibility assumption: an empty declaration publishes chat only;
+  known divergences (usage field names, missing tool-call id, list-shaped
+  content) are handled explicitly and reported in response metadata;
+  capability_probe()/verified_capabilities() expose only observed features
+- cancellation: run_with_cancellation makes a blocking request interruptible and
+  re-raises worker exceptions unchanged
+- sanctum: optional transport fields on ModelEntry (minor, no migration) and a
+  loader check that rejects a literal secret in extra_headers
+- tests: 100 new offline tests; 783/784 PASS; ruff check clean
+- independent review (1 round): 1 BLOCKER + 1 MAJOR found and fixed
+```
+
+---
+
+*Конец IMPLEMENTATION_LOG.md S13.*
+
+---
+
+## S14 — Streaming и нормализация tool calls
+
+### 1. Цель и объём
+
+Дать CORE/UI **единый внутренний поток событий** вместо «дождаться всего
+ответа», при этом сохранив два жёстких инварианта: tool call запускается только
+после полной валидации аргументов, а отмена прекращает любую последующую
+обработку. В объём вошли: конверт событий с гарантией порядка, инкрементальный
+SSE-парсер, потоковый транспорт с прерываемым чтением, сборка фрагментов
+аргументов tool call, `stream()` в OpenAI-compatible адаптере, лимиты стрима в
+конфигурации и offline-тесты на loopback mock server. Маршрутизация запросов,
+privacy gate и подключение стрима к runtime — S15.
+
+### 2. Компоненты
+
+- `model_layer/stream.py` — конверт и порядок:
+  - `StreamEventType` — 9 видов: `start`, `text_delta`, `tool_call_start`,
+    `tool_call_args_delta`, `tool_call`, `usage`, `done`, `error`, `cancelled`;
+  - `StreamEvent` — dataclass с `sequence`, `is_terminal`, `to_dict()`
+    (сериализация санитизирует `text_delta`, `tool_call_id`, `tool_call_name`,
+    `arguments_delta`, `metadata`, `error`);
+  - `StreamSequencer` — единственный конструктор событий адаптера, поэтому
+    контракт порядка — свойство кода, а не соглашение;
+  - `validate_stream(events)` — проверка контракта для тестов/буферизующего
+    потребителя;
+  - `StreamLimits` — `max_response_bytes` 8 МБ, `max_event_bytes` 1 МБ,
+    `max_arguments_bytes` 1 МБ, `max_tool_calls` 64,
+    `idle_timeout_seconds` 120 с; все значения обязаны быть > 0 (нет
+    «0 отключает»), `tool_call_limits()` проецирует их в accumulator;
+  - `RedactingDeltaBuffer` — буфер с удержанием хвоста, который не даёт
+    выпустить известный секрет по частям (§8).
+- `model_layer/sse.py` — `SSEMessage`, инкрементальный `SSEParser`
+  (`feed_line`/`close`, `max_event_bytes`, счёт в байтах),
+  `SSEEventTooLargeError`, `STREAM_DONE_SENTINEL = "[DONE]"`.
+- `model_layer/tool_calls.py` — `ToolCallLimits`, `ToolCallAccumulator`:
+  сборка по `index` (а не по позиции в массиве), `finish()` — **единственная**
+  точка создания `ToolCall`.
+- `model_layer/http_transport.py` — `StreamIdle` (сигнал опроса, не ошибка),
+  `HttpStream` Protocol (`read_line(timeout)`/`close`), `UrllibTransport.open_stream()`
+  → `_UrllibStream` (daemon-thread pump + очередь с бюджетом по памяти),
+  `_BufferedStream` (не-200 ответ отдаётся через тот же интерфейс).
+- `model_layer/openai_compatible.py` — `stream()`, `_stream_events`,
+  `_pump_stream`, `_delta_text`, `_delta_tool_calls`, `_build_payload(stream=True)`,
+  `STREAM_ACCEPT = "text/event-stream"`; поля `stream_limits`,
+  `stream_include_usage` в конфиге адаптера.
+- `model_layer/provider.py` — базовый `ModelProvider.stream()` (заглушка для
+  провайдеров без реального стриминга) тоже строит события через
+  `StreamSequencer` и завершает поток терминальным событием.
+- `sanctum/config_schemas.py` — `ModelEntry.stream_max_response_bytes`,
+  `stream_max_event_bytes`, `stream_max_arguments_bytes`, `stream_max_tool_calls`,
+  `stream_idle_timeout_seconds`, `stream_include_usage` (все опциональные —
+  minor по CONTRACTS §6.1, конфиг до S14 работает без миграции).
+- `contracts/sanitization.py` — `max_known_secret_length()`,
+  `split_releasable(text)`; `response.py::ToolCall.to_dict()` теперь санитизирует
+  `id`/`name`/`arguments`/`raw_arguments`.
+- `backend/tests/model_layer/test_streaming.py` — 165 тестов;
+  `backend/tests/model_layer/test_fake_provider.py` — +1;
+  `backend/tests/sanctum/test_provider_transport_config.py` — +2.
+
+### 3. Гарантии порядка stream events
+
+Порядок не документируется, а **проверяется** `StreamSequencer`, который
+является единственным способом создать событие в адаптере:
+
+1. `sequence` начинается с 0 и строго возрастает без пропусков и повторов;
+2. `START` — первое событие и ровно одно (повторный `start()` → `RuntimeError`);
+3. ровно одно терминальное событие (`done`/`error`/`cancelled`) и оно последнее:
+   любое событие после терминального → `RuntimeError`;
+4. `TOOL_CALL` эмитится только для полностью собранного и валидированного
+   вызова, никогда для фрагмента;
+5. `TOOL_CALL_START` для данного `index` всегда раньше первого
+   `TOOL_CALL_ARGS_DELTA` этого `index` (событие START эмитится при первом
+   появлении `index`, даже если сервер прислал аргументы раньше имени);
+6. `flush()` буферов удержания выполняется **до** `TOOL_CALL`, поэтому ни один
+   `text_delta`/`tool_call_args_delta` не появляется после терминального события.
+
+Нарушение — программная ошибка адаптера, а не сбой провайдера, поэтому это
+`RuntimeError`, а не `ProviderError`; в поток она попасть не может.
+
+Дополнительно адаптер защищён от «забытого» терминального события: любое
+исключение, не нормализованное в `ProviderError`, перехватывается вокруг
+`_pump_stream` и превращается в терминальный `error` (в сообщение попадает
+только **тип** исключения, т.к. текст — недоверенные данные).
+
+### 4. Как исключён запуск неполного tool call
+
+`ToolCall` создаётся только в `ToolCallAccumulator.finish()`. До этого
+существуют лишь `_PartialCall` (id/name/строка аргументов). `finish()`:
+
+1. парсит каждый payload как JSON и требует **объект** (`normalize_tool_calls`);
+2. отвергает набор **целиком**, если хотя бы у одного вызова нет имени, битый
+   или усечённый JSON, дубликат `id`, `id` сменился mid-stream, отрицательный
+   `index` или превышен лимит (число вызовов / байты аргументов / длина имени);
+3. при ошибке не возвращает **ни одного** вызова, а адаптер эмитит
+   терминальный `error` (`RESPONSE_FORMAT_INVALID`).
+
+Поэтому «половина плана» не может уйти на исполнение: потребитель либо получает
+весь набор валидных вызовов, либо ни одного. Пустой `id` синтезируется
+детерминированно (`<provider>_call_<index>`) и факт виден в
+`metadata["provider"][<id>]["synthesized_tool_call_ids"]`.
+
+Живые `tool_call_args_delta` — это только UI-подсказка (и они санитизированы,
+поэтому могут не быть валидным JSON); авторитетный источник — событие
+`TOOL_CALL`, построенное из несanitized-копии, которую держит accumulator.
+
+### 5. Что происходит при обрыве потока на середине аргументов
+
+- Транспорт: `read_line` возвращает `None` на EOF (флаг «липкий»: повторный
+  вызов тоже `None`, а не `StreamIdle`), поэтому конец потока не путается с
+  «пока тихо».
+- `SSEParser.close()` диспатчит незавершённое событие: если сервер успел
+  прислать `data:`-строку, но не пустую строку-разделитель, данные не теряются.
+- Затем `finish()` пытается распарсить накопленную строку аргументов; усечённый
+  JSON → `RESPONSE_FORMAT_INVALID`, вызовов **ноль**, терминальное событие —
+  `error`. Никакой попытки «достроить» или исполнить частичный вызов нет.
+- Если обрыв случился **после** полностью валидного вызова (все фрагменты
+  пришли, `[DONE]` — нет), вызов эмитится ровно один раз и поток завершается
+  `done`; дублирования нет, потому что `finish()` вызывается один раз, а
+  `TOOL_CALL` строится только из него.
+- Если не пришло ни одного события и не было `[DONE]` — это не SSE, а
+  `RESPONSE_FORMAT_INVALID` («stream closed before any event arrived»).
+
+### 6. Отмена и таймауты
+
+- Токен проверяется **до** открытия соединения (pre-cancel: запрос не уходит) и
+  на каждой итерации чтения. Транспорт отдаёт управление каждые
+  `_STREAM_POLL_SECONDS = 0.05` (`StreamIdle`), поэтому отмена не ждёт чанка.
+- При отмене следующим событием становится `cancelled` (терминальное), и
+  генератор завершается — дальнейшая эмиссия структурно невозможна.
+- Два независимых предела: общий (`timeout_seconds` запроса/конфига) и
+  «тишина» (`idle_timeout_seconds`); оба дают `PROVIDER_TIMEOUT`.
+- `close()` потока закрывает **сам socket**: на Windows `shutdown` и
+  `HTTPResponse.close()` не прерывают pending `recv`, а закрытие socket — может;
+  pump после этого сам закрывает response из своего потока (чтобы не бороться за
+  лок буферизованного reader'а). Потребитель, который перестал читать,
+  освобождает соединение мгновенно, а не через таймаут.
+
+### 7. Лимиты и защита от «дорогого» ответа
+
+| Лимит | Значение по умолчанию | Где проверяется |
+| --- | --- | --- |
+| `max_response_bytes` | 8 000 000 | по декодированным байтам каждой строки |
+| `max_event_bytes` | 1 000 000 | `SSEParser` (в байтах UTF-8) |
+| `max_arguments_bytes` | 1 000 000 | `ToolCallAccumulator.feed` |
+| `max_tool_calls` | 64 | `ToolCallAccumulator.feed` |
+| `idle_timeout_seconds` | 120 | `_pump_stream` |
+
+Очередь между pump-потоком и потребителем ограничена бюджетом
+(`DEFAULT_MAX_BUFFERED_BYTES = 1 МБ`): без него быстрый endpoint вычитывался бы
+в память быстрее, чем потребитель успевает применить `max_response_bytes`.
+`stream_include_usage` по умолчанию **выключен**: `stream_options` понимает не
+каждый совместимый сервер, а `usage` — необязательное поле.
+
+### 8. Секреты в потоке
+
+Санитизация отдельного фрагмента не ловит ключ, разрезанный между чанками.
+Поэтому живой delta проходит через `RedactingDeltaBuffer`, который отдаёт только
+тот префикс, который `contracts.sanitization.split_releasable()` доказал
+безопасным:
+
+- хвост, являющийся **собственным префиксом** известного секрета, удерживается
+  (его может завершить следующий фрагмент);
+- граница разреза не попадает **внутрь** уже присутствующего вхождения секрета
+  (иначе секрет с «бордером» — первый символ равен последнему — или периодичный
+  секрет выпускался бы почти целиком: проверено, наивный разрез отдавал 18 из 19
+  символов);
+- удержание ограничено, поэтому патологический периодический поток не растит
+  буфер без предела; выпускаемое всё равно санитизируется, то есть полного
+  секрета в одном событии не бывает.
+
+На терминальном пути (`error`/`cancelled`) удержанный хвост **отбрасывается**, а
+не сбрасывается: усечённый секрет не должен уйти наружу.
+
+### 9. Верификация
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest -q          # 951 passed, 1 skipped
+.\.venv\Scripts\python.exe -m ruff check backend/ # All checks passed!
+```
+
+До S14: 783 passed, 1 skipped. Добавлено 168 тестов
+(`test_streaming.py` 159, `test_fake_provider.py` +1,
+`test_provider_transport_config.py` +2, плюс параметризация).
+
+Ручная проверка (локальный SSE-сервер, скрипт удалён после прогона):
+
+```
+1. fragmented JSON   : 3 ARGS_DELTA -> TOOL_CALL {'path': 'a.txt'}      (PASS)
+2. truncated args    : ERROR RESPONSE_FORMAT_INVALID, calls=0           (PASS)
+3. cancel mid-stream : START, TEXT_DELTA, CANCELLED                     (PASS)
+4. early close       : 1 TOOL_CALL + DONE, без дублирования             (PASS)
+5. duplicate ids     : ERROR, calls=0                                   (PASS)
+6. size limit        : ERROR (response exceeds ...)                     (PASS)
+7. split secret      : "[REDACTED]" в delta и в response, половин нет   (PASS)
+```
+
+Ложноположительность проверена откатом фиксов:
+
+- откат `_avoid_splitting_an_occurrence` → падает
+  `test_a_complete_secret_in_one_fragment_is_redacted_as_a_unit` для секрета с
+  бордером (наивный разрез выпускает 18/19 символов);
+- откат `_release`/бюджета очереди → падает
+  `test_reader_does_not_buffer_far_ahead_of_the_consumer`;
+- откат «липкого» EOF → падает `test_end_of_stream_is_sticky`;
+- откат `except` вокруг `_pump_stream` → поток завершается без терминального
+  события.
+
+### 10. Ответы на обязательные вопросы
+
+- **Гарантии порядка stream events?** §3: `sequence` с 0 без пропусков; `START`
+  первый и один; ровно одно терминальное событие последним; `TOOL_CALL` только
+  для валидированного вызова; `TOOL_CALL_START` раньше `ARGS_DELTA` своего
+  `index`; всё проверяется `StreamSequencer` (нарушение — `RuntimeError`), а
+  любое не нормализованное исключение превращается в терминальный `error`.
+- **Как исключён запуск неполного tool call?** §4: `ToolCall` создаётся только в
+  `ToolCallAccumulator.finish()`, который валидирует весь набор и при любой
+  проблеме не возвращает ни одного вызова, а адаптер эмитит `error`.
+- **Что при обрыве потока на середине аргументов?** §5: незавершённое SSE-событие
+  диспатчится, усечённый JSON отвергается, вызовов ноль, терминальное событие —
+  `error` (`RESPONSE_FORMAT_INVALID`).
+
+### 11. Ручная проверка пользователя
+
+Пользователь подтвердил сценарий «JSON, разбитый на несколько stream chunks»:
+три `tool_call_args_delta` собираются в один `tool_call` с аргументами
+`{'path': 'a.txt'}`, и вызов эмитится один раз, после полной сборки.
+
+### 12. Ограничения и долги
+
+1. **Privacy gate не подключён к runtime** — обязательный долг S15: сейчас
+   стрим защищает только от известных секретов и от форматов-паттернов
+   (`sanitize_text`), но не применяет политику приватности к содержимому.
+2. **Оценка токенов эвристична** (`len/4`) — не влияет на стрим, но
+   `max_output_tokens`/`context_limit` проверяются по ней.
+3. **`reasoning_metadata` не проверяется** — стрим не разбирает reasoning-дельты
+   (провайдер-специфичные поля игнорируются).
+4. **Аргументы tool call санитизируются** и потому могут «портиться»
+   (аргумент с именем вида `api_key` редактируется). Для инструментов SERAPHIM
+   учётные данные передаются ссылками; политику уточнить в S19 (WINGS).
+5. **Живые `args_delta` могут не быть валидным JSON** (санитизация + удержание
+   хвоста). Это осознанно: авторитетное событие — `TOOL_CALL`, а delta нужна
+   только для отображения.
+6. **Санитизация серверных полей живёт в адаптере**, а не в контракте
+   (`ModelResponse`/`ToolCall`), — кандидат на общий helper при появлении
+   второго HTTP-провайдера.
+7. **`max_response_bytes` считается по декодированным и повторно
+   закодированным байтам**, поэтому может быть завышен для битого UTF-8 (в
+   сторону безопасности: занизить его нельзя).
+8. **Дефолты `StreamLimits` и `ModelEntry.stream_*` существуют дважды**
+   (`sanctum` не может импортировать `model_layer`); синхронность держит тест
+   `test_config_defaults_agree_with_the_adapter_limits`.
+9. Незакоммиченные изменения S07–S13 сохранены; S14 не коммитит (по инструкции).
+
+### 13. Резюме изменений
+
+```
+backend/seraphim/model_layer/
+  stream.py             — StreamEventType, StreamEvent, StreamSequencer,
+                          StreamLimits, RedactingDeltaBuffer, validate_stream
+  sse.py                — SSEMessage, SSEParser, SSEEventTooLargeError
+  tool_calls.py         — ToolCallLimits, ToolCallAccumulator
+  http_transport.py     — +StreamIdle, HttpStream, open_stream, _UrllibStream,
+                          _BufferedStream, DEFAULT_MAX_BUFFERED_BYTES
+  openai_compatible.py  — +stream/_stream_events/_pump_stream,
+                          stream_limits, stream_include_usage
+  provider.py           — базовый stream() через StreamSequencer
+  __init__.py           — экспорт новых имён
+backend/seraphim/contracts/sanitization.py  — +max_known_secret_length,
+                                              +split_releasable
+backend/seraphim/model_layer/response.py    — ToolCall.to_dict() санитизирует
+                                              id/name/arguments
+backend/seraphim/sanctum/config_schemas.py  — ModelEntry: stream_* поля
+backend/tests/model_layer/test_streaming.py            — 165 тестов
+backend/tests/model_layer/test_fake_provider.py        — +1 тест
+backend/tests/sanctum/test_provider_transport_config.py — +2 теста
+CONTRACTS.md — §2.5: реализация S14 (включая гарантию по секретам)
+IMPLEMENTATION_PLAN.md — S14 переведён в ВЫПОЛНЕН
+```
+
+### 14. Предлагаемое сообщение коммита
+
+```
+feat: S14 streaming and tool-call normalization
+
+- model_layer/stream.py: normalized StreamEvent envelope (start, text_delta,
+  tool_call_start, tool_call_args_delta, tool_call, usage, done, error,
+  cancelled) with an ordering contract enforced by StreamSequencer: sequence
+  from 0 without gaps, START first and once, exactly one terminal event last
+- model_layer/sse.py: incremental text/event-stream parser (byte-counted event
+  cap, tolerant line endings, dispatches a trailing unterminated event)
+- model_layer/tool_calls.py: fragments are assembled per index; a ToolCall is
+  created only by finish(), which validates the whole batch (JSON object
+  arguments, name present, unique ids, id stable mid-stream, size limits) and
+  returns nothing at all when any call is unusable
+- model_layer/http_transport.py: open_stream() with a background pump and a
+  bounded buffer, so a read is interruptible and a fast endpoint cannot be
+  pulled into memory ahead of the consumer; close() closes the socket, the one
+  operation that unblocks a pending recv on Windows
+- model_layer/openai_compatible.py: stream() with a capability gate and
+  validate_request before the generator, pre-cancel before any request, idle
+  and overall deadlines, mid-stream cancellation, and a defensive terminal
+  error for any non-normalized exception
+- secret safety: live deltas pass through RedactingDeltaBuffer, which releases
+  only a prefix that split_releasable() proves cannot be part of a known secret,
+  so a credential split across chunks is redacted as a unit
+- sanctum: optional stream_* caps on ModelEntry (minor, no migration)
+- tests: 168 new offline tests against a loopback SSE server; 951/952 PASS;
+  ruff check clean
+- independent review (2 rounds): 3 blockers and 9 findings found and fixed
+```
+
+---
+
+*Конец IMPLEMENTATION_LOG.md S14.*
+
+
+
+## S15 — COMPASS: детерминированная маршрутизация моделей
+
+Пакет `backend/seraphim/compass/` — чистая функция выбора провайдера по объявленным
+кандидатам. Сокеты не открываются, CORE/WINGS не импортируются. Каждый отказ
+кандидата содержит причину (`rejected`), fallback помечается явно (`fallback=True`).
+
+Режимы: `manual` (явный `model_id`, несовместимость — `COMPASS_CONFLICT`, без
+молчаливого fallback), `rule_based` (правила `(-priority, id)`, затем первый
+пригодный кандидат по объявленному порядку). Отказы: `NO_MODEL_AVAILABLE`,
+`ROUTING_TIMEOUT` (через инжектируемые часы). Приватность проверяется через
+`decide_transmission`; offline исключает внешние модели.
+
+Возможности берутся из `verified_capabilities()` (добавлен в `ModelProvider`,
+по умолчанию пусто; у `FakeProvider` совпадает с декларацией).
+
+### Верификация
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest backend/tests/compass -q   # 21 passed
+.\.venv\Scripts\python.exe -m pytest -q                             # 1010 passed, 1 skipped
+.\.venv\Scripts\python.exe -m ruff check backend/                   # All checks passed!
+```
+
+`backend/tests/compass/test_router.py` — 21 тест: ручной режим, правила, детерминизм,
+fallback, таймаут, фильтр возможностей, приватность и offline, конфигурация.

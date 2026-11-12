@@ -50,10 +50,16 @@ class ErrorCode:
     COMPASS_CONFLICT = "COMPASS_CONFLICT"
 
     # --- MODEL LAYER ---
+    # Base set per CONTRACTS.md §2.5; the extra codes normalise the remaining
+    # provider failure modes (S12) without inventing provider-specific fields.
     PROVIDER_UNAVAILABLE = "PROVIDER_UNAVAILABLE"
     PROVIDER_AUTH_FAILED = "PROVIDER_AUTH_FAILED"
     PROVIDER_TIMEOUT = "PROVIDER_TIMEOUT"
     RESPONSE_FORMAT_INVALID = "RESPONSE_FORMAT_INVALID"
+    PROVIDER_RATE_LIMITED = "PROVIDER_RATE_LIMITED"
+    PROVIDER_REQUEST_INVALID = "PROVIDER_REQUEST_INVALID"
+    PROVIDER_CANCELLED = "PROVIDER_CANCELLED"
+    PROVIDER_CAPABILITY_UNSUPPORTED = "PROVIDER_CAPABILITY_UNSUPPORTED"
 
     # --- MEMORY ---
     MEMORY_NOT_FOUND = "MEMORY_NOT_FOUND"
@@ -209,9 +215,11 @@ class SeraphimError(Exception):
         """Full diagnostic view. Still sanitized, but includes correlation IDs."""
         d = self.to_dict()
         d["safe_message"] = self.safe_message
-        d["correlation_id"] = self.correlation_id
-        d["task_id"] = self.task_id
-        d["tool_call_id"] = self.tool_call_id
+        # Correlation fields are caller-supplied free text, so they are scrubbed
+        # here as well: the method promises a sanitized view (S12 review MINOR D).
+        d["correlation_id"] = sanitize_text(self.correlation_id)
+        d["task_id"] = sanitize_text(self.task_id)
+        d["tool_call_id"] = sanitize_text(self.tool_call_id)
         d["sanitized_details"] = self.sanitized_details
         return d
 

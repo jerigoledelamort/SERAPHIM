@@ -98,6 +98,75 @@ def known_secret_count() -> int:
     return len(_KNOWN_SECRETS)
 
 
+def max_known_secret_length() -> int:
+    """Length of the longest registered secret value (0 when none are known).
+
+    Exposed so a *streaming* producer can bound the tail it holds back.  The
+    values themselves are never exposed.
+    """
+    return max((len(value) for value in _KNOWN_SECRETS), default=0)
+
+
+def split_releasable(text: str) -> tuple[str, str]:
+    """Split *text* so that no known secret is cut in two.
+
+    Returns ``(releasable, held)``.  ``held`` is a tail that a later fragment
+    could still complete into a known secret; ``releasable`` therefore never ends
+    with a fragment that could grow into one, and the boundary never falls inside
+    an occurrence that is already present.
+
+    This is what lets a streaming producer emit a delta immediately: scrubbing a
+    fragment on its own cannot catch a value split across two fragments, but a
+    fragment released by this function can never be one half of a secret.
+
+    Only values the process *knows* to be secret are covered (the configured
+    credential, registered by the secret store).  Pattern-only detection stays
+    best-effort, as everywhere else.
+    """
+    if not text or not _KNOWN_SECRETS:
+        return text, ""
+    cut = _avoid_splitting_an_occurrence(text, len(text) - _pending_prefix_length(text))
+    return text[:cut], text[cut:]
+
+
+def _pending_prefix_length(text: str) -> int:
+    """Length of the longest suffix of *text* that could still begin a secret.
+
+    A suffix that is a *proper* prefix of a registered secret may be completed by
+    a later fragment, so it must not be released yet.
+    """
+    pending = 0
+    for value in _KNOWN_SECRETS:
+        limit = min(len(value) - 1, len(text))
+        for length in range(limit, pending, -1):
+            if text.endswith(value[:length]):
+                pending = length
+                break
+    return pending
+
+
+def _avoid_splitting_an_occurrence(text: str, cut: int) -> int:
+    """Move *cut* back to the start of any secret occurrence it would split.
+
+    The prefix rule alone is not enough: a secret whose first character also ends
+    it (a border) is itself a suffix of ``text`` *and* starts like a proper
+    prefix, so the naive cut would land one character inside the occurrence and
+    release almost the whole value.  Lowering the cut can expose another split
+    occurrence, so the check repeats until the cut is stable.
+    """
+    while True:
+        lowered = cut
+        for value in _KNOWN_SECRETS:
+            start = text.find(value)
+            while start != -1 and start < lowered:
+                if start + len(value) > lowered:
+                    lowered = start
+                start = text.find(value, start + 1)
+        if lowered == cut:
+            return cut
+        cut = lowered
+
+
 def sanitize_text(text: str) -> str:
     """Replace secret-like patterns and registered secret values with [REDACTED]."""
     result = text

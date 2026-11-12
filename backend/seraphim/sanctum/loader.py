@@ -262,6 +262,44 @@ def _check_secret_refs(models: list[Any], file_path: str) -> None:
             ) from exc
 
 
+def _check_model_headers(models: list[Any], file_path: str) -> None:
+    """Reject a literal credential in ``providers.models[].extra_headers``.
+
+    ``extra_headers`` carries non-secret transport headers (an organization id,
+    a beta flag).  A value that looks like a real key was pasted into the wrong
+    place, so the config is rejected instead of being accepted and later sent,
+    logged or exported.  The offending value is never echoed back.
+    """
+    for index, entry in enumerate(models):
+        headers = (
+            entry.get("extra_headers")
+            if isinstance(entry, dict)
+            else getattr(entry, "extra_headers", None)
+        )
+        if not isinstance(headers, dict):
+            continue
+        model_id = (
+            entry.get("id", f"#{index}")
+            if isinstance(entry, dict)
+            else getattr(entry, "id", f"#{index}")
+        )
+        for name, value in headers.items():
+            if isinstance(value, str) and looks_like_secret(value):
+                raise _fail(
+                    ErrorCode.SECRET_REF_INVALID,
+                    f"providers.models[{model_id}].extra_headers.{name} looks like a "
+                    f"literal secret. Store the value with 'seraphim secrets set <ref>' "
+                    f"and reference it with 'secret_ref' instead of pasting it into the "
+                    f"config.",
+                    user_action_required=True,
+                    details={
+                        "file": file_path,
+                        "key": f"providers.models[].extra_headers.{name}",
+                        "model_id": str(model_id),
+                    },
+                )
+
+
 def _check_mcp_credentials(servers: list[Any], file_path: str) -> None:
     """Reject literal secrets in MCP server launch settings.
 
@@ -374,6 +412,7 @@ def _load_config_for_domain(
         _check_entry_keys(merged["models"], ModelEntry, "providers.models", "providers.yaml")
         _check_duplicate_ids(merged["models"], "id", "providers", "merged config")
         _check_secret_refs(merged["models"], "providers.yaml")
+        _check_model_headers(merged["models"], "providers.yaml")
     if domain == "routing" and "rules" in merged:
         _check_entry_keys(merged["rules"], RoutingRule, "routing.rules", "routing.yaml")
         _check_duplicate_ids(merged["rules"], "id", "routing", "merged config")

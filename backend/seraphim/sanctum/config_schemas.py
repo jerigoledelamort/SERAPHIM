@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Any
 
 from seraphim.contracts.versioned import VersionedEntity
 
@@ -41,7 +42,14 @@ class RuntimeConfig(VersionedEntity):
 
 @dataclass
 class ModelEntry:
-    """Single model provider entry."""
+    """Single model provider entry.
+
+    Transport fields (S13) describe how to reach an HTTP endpoint; they are all
+    optional with conservative defaults, so a config written before S13 keeps
+    working unchanged (CONTRACTS.md §6.1 — adding an optional field is minor).
+    Nothing here selects an endpoint or a feature in source: an endpoint, its
+    paths, its auth scheme and its capabilities are *configuration*.
+    """
 
     id: str
     provider: str  # "anthropic", "openai", "local_ollama", etc.
@@ -55,6 +63,48 @@ class ModelEntry:
     # Cost metadata (cost_per_million_tokens_in, cost_per_million_tokens_out).
     cost_input: float = 0.0
     cost_output: float = 0.0
+
+    # --- HTTP transport (S13) -------------------------------------------------
+    # Per-request timeout in seconds.
+    timeout_seconds: float = 30.0
+    # Path appended to ``endpoint`` for a chat completion request.
+    chat_path: str = "/v1/chat/completions"
+    # Path appended to ``endpoint`` for the health/capability probe.
+    health_path: str = "/v1/models"
+    # How the credential is presented: "bearer" (Authorization: Bearer <key>),
+    # "api_key" (raw value in ``auth_header``, e.g. Azure ``api-key``) or "none".
+    auth_scheme: str = "bearer"
+    # Header name used to carry the credential.
+    auth_header: str = "Authorization"
+    # Extra non-secret headers sent with every request.  A value that looks like
+    # a literal credential is rejected by the loader — this field is not a place
+    # to paste an API key.
+    extra_headers: dict[str, str] = field(default_factory=dict)
+    # Name of the request field that carries the output-token budget.  Most
+    # OpenAI-compatible servers use "max_tokens"; newer OpenAI models use
+    # "max_completion_tokens"; an empty string omits the field entirely.
+    max_tokens_field: str = "max_tokens"
+    # Explicit capability declaration for this endpoint.  Capabilities are never
+    # inferred from the model name; an empty map means "chat only".
+    capabilities: dict[str, Any] = field(default_factory=dict)
+
+    # --- Streaming (S14) ------------------------------------------------------
+    # Caps enforced while consuming a streamed response.  They are optional with
+    # conservative defaults, so a config written before S14 keeps working; a
+    # declared value must be positive (there is no "0 disables" escape hatch).
+    # Total bytes of one streamed response body.
+    stream_max_response_bytes: int = 8_000_000
+    # Bytes of one accumulated SSE event.
+    stream_max_event_bytes: int = 1_000_000
+    # Assembled JSON arguments of one streamed tool call, in bytes.
+    stream_max_arguments_bytes: int = 1_000_000
+    # Maximum number of streamed tool calls in one response.
+    stream_max_tool_calls: int = 64
+    # Longest silence between two stream chunks before the stream is abandoned.
+    stream_idle_timeout_seconds: float = 120.0
+    # Ask the endpoint to include a usage object in the stream
+    # (OpenAI ``stream_options.include_usage``).  Off by default.
+    stream_include_usage: bool = False
 
 
 @dataclass
